@@ -1,0 +1,116 @@
+{
+  "manifest_version": 3,
+  "name": "Q-Sync Pro \u2014 Market Signal Studio",
+  "short_name": "Q-Sync Pro",
+  "version": "6.0.0",
+  "minimum_chrome_version": "116",
+  "description": "Reads live market ticks straight from the page's own WebSocket, builds candles, scores multi-timeframe confluence signals and keeps a paper-trading journal with expectancy stats. Signal-only: it never clicks for you.",
+  "permissions": [
+    "storage",
+    "alarms",
+    "sidePanel",
+    "notifications",
+    "scripting"
+  ],
+  "host_permissions": [
+    "*://quotex.io/*",
+    "*://*.quotex.io/*",
+    "*://qxbroker.com/*",
+    "*://*.qxbroker.com/*",
+    "*://qxbroker.digital/*",
+    "*://*.qxbroker.digital/*",
+    "*://quotex-broker.com/*",
+    "*://*.quotex-broker.com/*",
+    "*://qtx.market/*",
+    "*://*.qtx.market/*",
+    "*://k4q.io/*",
+    "*://*.k4q.io/*",
+    "https://data-api.binance.vision/*",
+    "https://query1.finance.yahoo.com/*",
+    "https://query2.finance.yahoo.com/*"
+  ],
+  "optional_host_permissions": [
+    "*://*/*"
+  ],
+  "background": {
+    "service_worker": "src/background/index.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://quotex.io/*",
+        "*://*.quotex.io/*",
+        "*://qxbroker.com/*",
+        "*://*.qxbroker.com/*",
+        "*://qxbroker.digital/*",
+        "*://*.qxbroker.digital/*",
+        "*://quotex-broker.com/*",
+        "*://*.quotex-broker.com/*",
+        "*://qtx.market/*",
+        "*://*.qtx.market/*",
+        "*://k4q.io/*",
+        "*://*.k4q.io/*"
+      ],
+      "js": [
+        "src/content/bridge.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": true
+    },
+    {
+      "matches": [
+        "*://quotex.io/*",
+        "*://*.quotex.io/*",
+        "*://qxbroker.com/*",
+        "*://*.qxbroker.com/*",
+        "*://qxbroker.digital/*",
+        "*://*.qxbroker.digital/*",
+        "*://quotex-broker.com/*",
+        "*://*.quotex-broker.com/*",
+        "*://qtx.market/*",
+        "*://*.qtx.market/*",
+        "*://k4q.io/*",
+        "*://*.k4q.io/*"
+      ],
+      "js": [
+        "src/content/hud.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "action": {
+    "default_title": "Q-Sync Pro",
+    "default_popup": "src/ui/popup/index.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "side_panel": {
+    "default_path": "src/ui/panel/index.html"
+  },
+  "options_page": "src/ui/options/index.html",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "commands": {
+    "toggle-hud": {
+      "suggested_key": {
+        "default": "Alt+Shift+Q"
+      },
+      "description": "Toggle the floating HUD"
+    },
+    "open-dashboard": {
+      "suggested_key": {
+        "default": "Alt+Shift+D"
+      },
+      "description": "Open the dashboard side panel"
+    }
+  }
+}

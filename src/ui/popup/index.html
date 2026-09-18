@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Q-Sync Pro</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; width: 292px; background: #070b10; color: #e7eef6;
+      font: 12.5px/1.45 "Segoe UI", system-ui, -apple-system, sans-serif;
+    }
+    .top { display: flex; align-items: center; gap: 6px; padding: 9px 11px;
+           background: linear-gradient(180deg,#111a24,#0c1219); border-bottom: 1px solid #1d2937; }
+    .brand { flex: 1; font-weight: 700; } .brand b { color: #4ea1ff; }
+    .conn { font-size: 10px; color: #7c8ca0; }
+    .conn.live { color: #2fbf71; } .conn.idle { color: #f5c33b; }
+    .wrap { padding: 10px 11px 12px; }
+    .pair { display: flex; gap: 6px; margin-bottom: 9px; }
+    select { flex: 1; background: #0c1219; color: #e7eef6; border: 1px solid #26374a;
+             border-radius: 7px; padding: 5px 6px; font: inherit; font-size: 11.5px; min-width: 0; }
+    .sig { border-radius: 11px; padding: 12px 10px; text-align: center; margin-bottom: 9px;
+           background: linear-gradient(135deg,#1b2430,#131a23); border: 1px solid rgba(255,255,255,.06); }
+    .sig .d { display: block; font-size: 18px; font-weight: 800; letter-spacing: .6px; }
+    .sig .w { display: block; font-size: 10px; color: #a8b7c8; margin-top: 3px;
+              overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .sig.up { background: linear-gradient(135deg,#0c3a20,#0a2417); } .sig.up .d { color: #2fbf71; }
+    .sig.down { background: linear-gradient(135deg,#3d1013,#26090b); } .sig.down .d { color: #e04b5b; }
+    .sig.veto { background: linear-gradient(135deg,#3a2f0c,#241d07); } .sig.veto .d { color: #f5c33b; }
+    .conf { height: 5px; border-radius: 3px; background: #0a0f15; margin-top: 8px; overflow: hidden; }
+    .conf i { display: block; height: 100%; width: 0; background: #4ea1ff; transition: width .3s; }
+    .row { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; }
+    .px { font-size: 17px; font-weight: 700; font-variant-numeric: tabular-nums; }
+    .clk { font-size: 11px; color: #4ea1ff; font-variant-numeric: tabular-nums; }
+    .stats { display: flex; gap: 6px; margin-bottom: 9px; }
+    .st { flex: 1; background: #0c1219; border: 1px solid #1d2937; border-radius: 8px; padding: 6px 7px; }
+    .st .k { font-size: 8.5px; color: #5d6d7f; text-transform: uppercase; letter-spacing: .5px; }
+    .st .v { font-size: 13px; font-weight: 700; font-variant-numeric: tabular-nums; }
+    .btns { display: flex; gap: 6px; }
+    button { flex: 1; background: #111a24; color: #cfe0f0; border: 1px solid #26374a; border-radius: 8px;
+             padding: 7px 6px; font: 600 11px "Segoe UI", system-ui, sans-serif; cursor: pointer; }
+    button:hover { background: #1b2b3a; color: #fff; }
+    button.pri { background: #14395e; border-color: #2a5c8f; color: #cfe6ff; }
+    .note { font-size: 9.5px; color: #5d6d7f; margin-top: 8px; text-align: center; }
+  </style>
+</head>
+<body>
+  <div class="top"><span class="brand">⚡ Q-Sync <b>Pro</b></span><span class="conn" id="conn">● …</span></div>
+  <div class="wrap">
+    <div class="pair">
+      <select id="pair"></select>
+      <select id="tf" style="flex:0 0 54px"><option value="m1">1m</option><option value="m5">5m</option><option value="m15">15m</option></select>
+    </div>
+    <div class="sig" id="sig">
+      <span class="d" id="dir">⏳</span><span class="w" id="why">waiting for data…</span>
+      <div class="conf"><i id="conf"></i></div>
+    </div>
+    <div class="row"><span class="px" id="px">—</span><span class="clk" id="clk">--</span></div>
+    <div class="stats">
+      <div class="st"><div class="k">W/L</div><div class="v" id="wl">—</div></div>
+      <div class="st"><div class="k">Edge</div><div class="v" id="edge">—</div></div>
+      <div class="st"><div class="k">Feed</div><div class="v" id="feed">—</div></div>
+    </div>
+    <div class="btns">
+      <button class="pri" id="dash">Dashboard</button>
+      <button id="hud">Toggle HUD</button>
+    </div>
+    <div class="note">Analysis only — Q-Sync never clicks or trades for you.</div>
+  </div>
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

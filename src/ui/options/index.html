@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Q-Sync Pro — Options</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; background: #070b10; color: #e7eef6;
+      font: 13px/1.55 "Segoe UI", system-ui, -apple-system, sans-serif;
+    }
+    .shell { max-width: 780px; margin: 0 auto; padding: 26px 20px 60px; }
+    h1 { font-size: 19px; margin: 0 0 4px; } h1 b { color: #4ea1ff; }
+    .sub { color: #7c8ca0; font-size: 12px; margin-bottom: 24px; }
+    h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .9px; color: #5d6d7f;
+         margin: 26px 0 10px; padding-bottom: 6px; border-bottom: 1px solid #1d2937; }
+    .card { background: #0c1219; border: 1px solid #1d2937; border-radius: 12px; padding: 14px 16px; margin-bottom: 12px; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: flex-end; }
+    label { font-size: 11px; color: #7c8ca0; display: flex; flex-direction: column; gap: 4px; }
+    input, select {
+      background: #111a24; color: #e7eef6; border: 1px solid #26374a; border-radius: 8px;
+      padding: 7px 9px; font: inherit; font-size: 12.5px; min-width: 220px;
+    }
+    button {
+      background: #111a24; color: #cfe0f0; border: 1px solid #26374a; border-radius: 8px;
+      padding: 8px 14px; font: 600 12px "Segoe UI", system-ui, sans-serif; cursor: pointer;
+    }
+    button:hover { background: #1b2b3a; color: #fff; }
+    button.pri { background: #14395e; border-color: #2a5c8f; color: #cfe6ff; }
+    button.danger { border-color: #5c2530; color: #ff9aa6; }
+    .muted { color: #7c8ca0; font-size: 12px; }
+    code { background: #111a24; padding: 1px 5px; border-radius: 4px; font-size: 11.5px; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th { text-align: left; font-size: 10px; text-transform: uppercase; letter-spacing: .5px;
+         color: #5d6d7f; padding: 5px 6px; border-bottom: 1px solid #1d2937; }
+    td { padding: 5px 6px; border-bottom: 1px solid rgba(29,41,55,.6); }
+    .ok { color: #2fbf71; } .bad { color: #e04b5b; }
+    .disc { background: rgba(245,195,59,.07); border: 1px solid rgba(245,195,59,.22);
+            border-radius: 10px; padding: 12px 14px; font-size: 12px; color: #d8c48c; }
+    kbd { background: #111a24; border: 1px solid #26374a; border-bottom-width: 2px;
+          border-radius: 5px; padding: 1px 6px; font-size: 11px; }
+    #out { font-size: 12px; margin-top: 9px; min-height: 16px; }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <h1>⚡ Q-Sync <b>Pro</b></h1>
+    <div class="sub">Market signal studio · v6.0.0 · analysis only, never auto-trades</div>
+
+    <h2>Site access</h2>
+    <div class="card">
+      <p class="muted">
+        The feed hook reads the WebSocket the page already opens. It is only installed on origins you
+        explicitly allow — there is no <code>&lt;all_urls&gt;</code> permission in this extension.
+      </p>
+      <div class="row">
+        <label style="flex:1">Origin
+          <input id="origin" type="text" placeholder="https://your-broker-mirror.example" />
+        </label>
+        <button class="pri" id="grant">Grant &amp; install hook</button>
+        <button id="detect">Use current tab</button>
+      </div>
+      <div id="out" class="muted"></div>
+      <h2 style="margin-top:20px">Installed hooks</h2>
+      <table id="hooks"><tr><td class="muted">loading…</td></tr></table>
+      <div class="row" style="margin-top:10px">
+        <button id="uninstall">Remove dynamic hook</button>
+        <button id="permList">Show granted origins</button>
+      </div>
+      <pre id="perms" class="muted" style="white-space:pre-wrap"></pre>
+    </div>
+
+    <h2>Data</h2>
+    <div class="card">
+      <div class="row">
+        <button id="csv">Export journal CSV</button>
+        <button id="exportAll">Export everything (JSON)</button>
+        <button id="importAll">Import JSON</button>
+        <button class="danger" id="wipe">Erase all extension data</button>
+      </div>
+      <input id="file" type="file" accept="application/json" style="display:none" />
+      <p class="muted" style="margin-top:10px">
+        The journal is paper trading only. Nothing here is connected to a broker account and nothing is
+        uploaded anywhere — all data stays in <code>chrome.storage</code> on this machine.
+      </p>
+    </div>
+
+    <h2>Shortcuts</h2>
+    <div class="card muted">
+      <p><kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>Q</kbd> — toggle the floating HUD on the current tab</p>
+      <p><kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>D</kbd> — open this dashboard as a side panel</p>
+      <p>Rebind them at <code>chrome://extensions/shortcuts</code>.</p>
+    </div>
+
+    <h2>How it reads prices</h2>
+    <div class="card muted">
+      <p>
+        1. A small script runs in the page's <b>main world</b> at <code>document_start</code> and wraps
+        <code>WebSocket</code>. Every frame the page receives is copied and relayed to the extension.
+      </p>
+      <p>
+        2. The service worker decodes the frame — JSON first, then a typed-array probe, then a regex
+        fallback — and turns it into candles. Frames it cannot decode are kept in the
+        <b>Protocol Lab</b> tab so you can see the real payload shape instead of guessing.
+      </p>
+      <p>
+        3. Candles survive service-worker restarts through <code>chrome.storage.session</code>, and
+        <code>chrome.alarms</code> restarts the heartbeat every 30 seconds.
+      </p>
+      <p>
+        4. If no broker tab is open, Binance public klines (crypto) and Yahoo (FX, delayed) keep the
+        engine warm. Both are labelled in the UI and are never mixed with live broker ticks.
+      </p>
+    </div>
+
+    <h2>Disclaimer</h2>
+    <div class="disc">
+      Q-Sync Pro is a charting and statistics tool. It does not place orders, click buttons, or interact
+      with a broker in any way. Binary options are a negative-expectation product for the overwhelming
+      majority of participants: at a typical 86% payout you need a 53.8% win rate simply to break even,
+      and OTC feeds are synthesised by the platform rather than sourced from an exchange. Use the journal
+      and backtester to measure the strategy honestly before you risk a single unit of real money.
+    </div>
+  </div>
+  <script type="module" src="options.js"></script>
+</body>
+</html>

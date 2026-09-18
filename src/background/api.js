@@ -1,0 +1,299 @@
+/* ------------------------------------------------------------------
+ * api.js — the single message surface every UI talks to.
+ *
+ * Returning a promise here means index.js can use one listener with
+ * `return true` and never accidentally close the message channel early
+ * (the classic MV3 "message port closed before a response was received").
+ * ----------------------------------------------------------------*/
+
+import * as store from './store.js';
+import * as ledger from './ledger.js';
+import * as settings from './settings.js';
+import * as engine from './engine.js';
+import { handleBatch } from './feeds/quotex.js';
+import { runBacktest, summarise, walkForward } from './backtest.js';
+import { toCSV, bySetup, bySymbol, byTimeframe, byDirection } from './journal.js';
+import { CRYPTO } from './feeds/binance.js';
+import { FX } from './feeds/yahoo.js';
+import { bucketOf, TF_MS } from './candles.js';
+
+const BRIDGE_IDS = ['qsync-bridge-main', 'qsync-hud'];
+
+export async function handleMessage(msg, sender) {
+  if (!msg || typeof msg.cmd !== 'string') return { ok: false, err: 'bad message' };
+  try {
+    switch (msg.cmd) {
+      /* ---------------- live data ---------------- */
+      case 'state.get':
+        return await stateGet(msg);
+
+      case 'symbols.select': {
+        const s = await settings.patch({ selectedSym: msg.sym || null });
+        engine.invalidate(s.selectedSym);
+        return { ok: true, selectedSym: s.selectedSym };
+      }
+
+      case 'symbols.list':
+        return { ok: true, symbols: store.listSymbols() };
+
+      /* ---------------- settings ---------------- */
+      case 'settings.get':
+        return { ok: true, settings: await settings.load() };
+
+      case 'settings.patch': {
+        const next = await settings.patch(msg.patch || {});
+        if (msg.patch?.selectedSym !== undefined) engine.invalidate(next.selectedSym);
+        return { ok: true, settings: next };
+      }
+
+      case 'settings.reset':
+        return { ok: true, settings: await settings.reset() };
+
+      /* ---------------- journal ---------------- */
+      case 'journal.summary':
+        return { ok: true, journal: journalPayload(await settings.load()) };
+
+      case 'journal.reset':
+        ledger.reset();
+        return { ok: true };
+
+      case 'journal.csv':
+        return { ok: true, csv: toCSV(ledger.trades) };
+
+      case 'journal.trade.close': {
+        const t = ledger.trades.find((x) => x.id === msg.id && !x.result);
+        if (!t) return { ok: false, err: 'not found' };
+        ledger.settleTrade(t, msg.price ?? t.entry);
+        ledger.persist();
+        return { ok: true };
+      }
+
+      /* ---------------- feed intake ---------------- */
+      case 'feed.frame':
+      case 'feed.batch': {
+        const frames = Array.isArray(msg.frames) ? msg.frames : [msg.frame || msg];
+        const r = handleBatch(frames);
+        if (sender?.tab?.id) store.diag.bridges.add(sender.tab.id);
+        return { ok: true, ...r };
+      }
+
+      case 'feed.ping': {
+        if (sender?.tab?.id) store.diag.bridges.add(sender.tab.id);
+        return { ok: true, frames: store.diag.frames, ticks: store.diag.ticks, pairs: store.symbols.size };
+      }
+
+      case 'feed.socket': {
+        // A WebSocket was opened on a hooked page. Lets the UI tell the
+        // difference between "hook not injected" (0 sockets) and "socket
+        // opened but its frames live somewhere we cannot see" (>0 sockets).
+        store.diag.sockets++;
+        if (sender?.tab?.id) store.diag.bridges.add(sender.tab.id);
+        return { ok: true, sockets: store.diag.sockets };
+      }
+
+      case 'feed.samples':
+        return { ok: true, samples: store.diag.samples, errors: store.diag.errors };
+
+      case 'feed.clearSamples':
+        store.diag.samples = [];
+        store.diag.unparsed = 0;
+        return { ok: true };
+
+      case 'diag.reset':
+        store.resetDiag();
+        return { ok: true };
+
+      case 'ui.openPanel': {
+        const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+        if (tab?.windowId != null) await chrome.sidePanel.open({ windowId: tab.windowId }).catch(() => {});
+        return { ok: true };
+      }
+
+      /* ---------------- backtest ---------------- */
+      case 'backtest.run': {
+        const s = await settings.load();
+        const sym = msg.sym || s.selectedSym;
+        const st = store.getSymbol(sym);
+        if (!st) return { ok: false, err: `No data for ${sym}` };
+        store.refreshDerived(sym);
+        const base = msg.tf === 'm5' ? st.tf.m5 : st.tf.m1;
+        const result = runBacktest(base, {
+          sym,
+          tf: msg.tf === 'm5' ? 'm5' : 'm1',
+          payout: msg.payout ?? (Number.isFinite(st.payout) ? st.payout : s.payout),
+          stake: msg.stake ?? Math.max(0.01, ((s.balance || 100) * (s.riskPct || 1)) / 100),
+          expiryBars: msg.expiryBars ?? s.expiryMinutes,
+          warmup: msg.warmup ?? 60,
+          strategy: { ...s.strategy, ...(msg.strategy || {}) },
+        });
+        if (!result.ok) return result;
+        return {
+          ok: true,
+          summary: summarise(result),
+          stats: result.stats,
+          bars: result.bars,
+          evaluated: result.evaluated,
+          skipped: result.skipped,
+          trades: result.trades.slice(-120),
+          equity: result.equity.slice(-200),
+        };
+      }
+
+      case 'backtest.walk': {
+        const s = await settings.load();
+        const sym = msg.sym || s.selectedSym;
+        const st = store.getSymbol(sym);
+        if (!st) return { ok: false, err: `No data for ${sym}` };
+        store.refreshDerived(sym);
+        const base = msg.tf === 'm5' ? st.tf.m5 : st.tf.m1;
+        const wf = walkForward(base, {
+          sym,
+          tf: msg.tf === 'm5' ? 'm5' : 'm1',
+          payout: msg.payout ?? (Number.isFinite(st.payout) ? st.payout : s.payout),
+          stake: msg.stake ?? 1,
+          expiryBars: msg.expiryBars ?? s.expiryMinutes,
+          warmup: msg.warmup ?? 60,
+          strategy: { ...s.strategy, ...(msg.strategy || {}) },
+        }, msg.folds || 4);
+        return wf;
+      }
+
+      /* ---------------- dynamic script registration ---------------- */
+      case 'scripts.register': {
+        const origin = msg.origin;
+        if (!/^https?:\/\/[^/]+/.test(origin || '')) return { ok: false, err: 'bad origin' };
+        const pattern = `${origin}/*`;
+        const granted = await hasPermission(pattern);
+        if (!granted) return { ok: false, err: 'permission not granted' };
+        await chrome.scripting.unregisterContentScripts({ ids: BRIDGE_IDS }).catch(() => {});
+        await chrome.scripting.registerContentScripts([
+          { id: BRIDGE_IDS[0], matches: [pattern], js: ['src/content/bridge.js'], runAt: 'document_start', world: 'MAIN', allFrames: true },
+          { id: BRIDGE_IDS[1], matches: [pattern], js: ['src/content/hud.js'], runAt: 'document_idle', allFrames: false },
+        ]);
+        return { ok: true, pattern };
+      }
+
+      case 'scripts.unregister':
+        await chrome.scripting.unregisterContentScripts({ ids: BRIDGE_IDS }).catch(() => {});
+        return { ok: true };
+
+      case 'scripts.list': {
+        const list = await chrome.scripting.getRegisteredContentScripts({ ids: BRIDGE_IDS }).catch(() => []);
+        return { ok: true, scripts: list.map((s) => ({ id: s.id, matches: s.matches })) };
+      }
+
+      default:
+        return { ok: false, err: `unknown cmd ${msg.cmd}` };
+    }
+  } catch (e) {
+    store.noteError(`${msg.cmd}: ${e?.message || e}`);
+    return { ok: false, err: String(e?.message || e) };
+  }
+}
+
+async function hasPermission(pattern) {
+  try {
+    return await chrome.permissions.contains({ origins: [pattern] });
+  } catch {
+    return false;
+  }
+}
+
+async function stateGet(msg) {
+  const s = await settings.load();
+  const sym = msg.sym || s.selectedSym || autoSelect();
+  if (sym && sym !== s.selectedSym) await settings.patch({ selectedSym: sym });
+
+  const ev = sym ? engine.evaluate(sym, s) : { signal: null, open: [], settled: [], newBar: false };
+  const st = sym ? store.getSymbol(sym) : null;
+
+  const want = Math.min(Math.max(msg.candles || 120, 30), 400);
+  const payload = {
+    ok: true,
+    now: Date.now(),
+    settings: s,
+    selectedSym: sym,
+    symbol: st
+      ? {
+          sym: st.sym,
+          source: st.source,
+          price: Number.isFinite(st.price) ? st.price : null,
+          ts: st.ts,
+          payout: st.payout,
+          ticks: st.tickCount,
+          stale: store.isStale(st),
+          bars: { m1: st.tf.m1.length, m5: st.tf.m5.length, m15: st.tf.m15.length },
+        }
+      : null,
+    candles: st
+      ? {
+          m1: st.tf.m1.slice(-want),
+          m5: st.tf.m5.slice(-Math.round(want * 0.7)),
+          m15: st.tf.m15.slice(-Math.round(want * 0.5)),
+        }
+      : { m1: [], m5: [], m15: [] },
+    signal: ev.signal,
+    preview: ev.preview || null,
+    secondsToClose: ev.secondsToClose ?? null,
+    sync: buildSync(st, ev.tf, msg.now || Date.now()),
+    openTrades: ev.open,
+    journal: journalPayload(s),
+    symbols: store.listSymbols(),
+    catalog: { quotex: store.listSymbols().filter((x) => x.source === 'quotex').map((x) => x.sym), crypto: Object.keys(CRYPTO), fx: Object.keys(FX) },
+    diag: {
+      frames: store.diag.frames,
+      ticks: store.diag.ticks,
+      historyRows: store.diag.historyRows,
+      binaryFrames: store.diag.binaryFrames,
+      unparsed: store.diag.unparsed,
+      sockets: store.diag.sockets,
+      restPolls: store.diag.restPolls,
+      bridges: store.diag.bridges.size,
+      pairs: store.symbols.size,
+      lastFrameAge: store.diag.lastFrameAt ? Date.now() - store.diag.lastFrameAt : null,
+      uptime: Date.now() - store.diag.startedAt,
+      errors: store.diag.errors,
+      samples: store.diag.samples.slice(0, 6),
+    },
+  };
+  return payload;
+}
+
+function buildSync(st, tf, now) {
+  if (!st) return null;
+  const t = tf || 'm1';
+  const tfMs = TF_MS[t] || TF_MS.m1;
+  const series = st.tf?.[t] || [];
+  const formingOpen = series.length ? series[series.length - 1].t : null;
+  return {
+    source: st.source,
+    formingOpen,
+    expectedOpen: bucketOf(now, tfMs),
+    aligned: formingOpen != null ? formingOpen === bucketOf(now, tfMs) : null,
+    tickAgeSec: st.ts ? Math.max(0, Math.round((now - st.ts) / 1000)) : null,
+    bars: series.length,
+  };
+}
+
+function journalPayload(s) {
+  return {
+    ...ledger.summary(Number.isFinite(s.payout) ? s.payout : 86),
+    recent: ledger.trades.slice(-40).reverse(),
+    events: ledger.events.slice(0, 30),
+    breakdown: {
+      setup: bySetup(ledger.trades).slice(0, 10),
+      symbol: bySymbol(ledger.trades).slice(0, 10),
+      timeframe: byTimeframe(ledger.trades),
+      direction: byDirection(ledger.trades),
+    },
+  };
+}
+
+/** Prefer a live Quotex pair, then anything live, then the first known symbol. */
+function autoSelect() {
+  const list = store.listSymbols();
+  if (!list.length) return null;
+  const live = list.filter((x) => !x.stale);
+  const pool = live.length ? live : list;
+  return (pool.find((x) => x.source === 'quotex') || pool[0]).sym;
+}

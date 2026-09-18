@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Q-Sync Pro — Dashboard</title>
+  <link rel="stylesheet" href="panel.css" />
+</head>
+<body>
+  <header class="top">
+    <div class="brand">⚡ Q-Sync <b>Pro</b><span class="ver">v6.0.0</span></div>
+    <div class="conn" id="conn" title="Feed status">● booting</div>
+  </header>
+
+  <div class="controls">
+    <select id="pair" title="Instrument"></select>
+    <select id="tf" title="Timeframe">
+      <option value="m1">1m</option>
+      <option value="m5">5m</option>
+      <option value="m15">15m</option>
+    </select>
+    <select id="expiry" title="Expiry">
+      <option value="1">1 min</option>
+      <option value="2">2 min</option>
+      <option value="3">3 min</option>
+      <option value="5">5 min</option>
+    </select>
+  </div>
+
+  <div class="signal" id="signal">
+    <div class="signal-main">
+      <span class="signal-dir" id="sigDir">⏳</span>
+      <span class="signal-why" id="sigWhy">waiting for data…</span>
+    </div>
+    <div class="signal-side">
+      <div class="price" id="price">—</div>
+      <div class="clock" id="clock">--</div>
+    </div>
+    <div class="conf"><i id="confBar"></i></div>
+  </div>
+
+  <nav class="tabs" id="tabs">
+    <button class="tab active" data-tab="chart">Chart</button>
+    <button class="tab" data-tab="signal">Signal</button>
+    <button class="tab" data-tab="journal">Journal</button>
+    <button class="tab" data-tab="backtest">Backtest</button>
+    <button class="tab" data-tab="feed">Feed</button>
+    <button class="tab" data-tab="settings">Settings</button>
+  </nav>
+
+  <main>
+    <!-- ================= CHART ================= -->
+    <section class="panel active" id="tab-chart">
+      <div class="chartwrap">
+        <canvas id="chart"></canvas>
+        <div class="tip" id="tip"></div>
+      </div>
+      <div class="readout" id="readout"></div>
+      <div class="list" id="preview" style="margin-top:7px"></div>
+      <h3>Indicators</h3>
+      <div class="grid" id="indis"></div>
+      <h3>Confluence votes</h3>
+      <div class="votes" id="votes"></div>
+    </section>
+
+    <!-- ================= SIGNAL ================= -->
+    <section class="panel" id="tab-signal">
+      <div class="card" id="sigCard"></div>
+      <h3>Context</h3>
+      <div class="grid" id="ctxGrid"></div>
+      <h3>Vetoes &amp; gates</h3>
+      <div id="vetoes" class="list"></div>
+      <h3>Live event log</h3>
+      <div id="events" class="log"></div>
+    </section>
+
+    <!-- ================= JOURNAL ================= -->
+    <section class="panel" id="tab-journal">
+      <div class="statgrid" id="jstats"></div>
+      <h3>Equity curve</h3>
+      <canvas id="equity" height="120"></canvas>
+      <h3>Win rate by setup</h3>
+      <table class="tbl" id="bySetup"></table>
+      <h3>By instrument</h3>
+      <table class="tbl" id="bySym"></table>
+      <h3>Recent trades</h3>
+      <table class="tbl" id="trades"></table>
+      <div class="row-btns">
+        <button class="btn" id="csv">Export CSV</button>
+        <button class="btn danger" id="jreset">Reset journal</button>
+      </div>
+    </section>
+
+    <!-- ================= BACKTEST ================= -->
+    <section class="panel" id="tab-backtest">
+      <p class="muted">Replays this exact strategy over the candles already collected for the selected instrument. Entry is the next bar's open, so there is no look-ahead.</p>
+      <div class="formrow">
+        <label>Timeframe
+          <select id="btTf"><option value="m1">1m</option><option value="m5">5m</option></select>
+        </label>
+        <label>Expiry (bars)<input id="btBars" type="number" min="1" max="15" value="1" /></label>
+        <label>Payout %<input id="btPay" type="number" min="10" max="200" value="86" /></label>
+        <label>Stake<input id="btStake" type="number" min="0.1" step="0.1" value="1" /></label>
+      </div>
+      <div class="row-btns">
+        <button class="btn primary" id="btRun">Run backtest</button>
+        <button class="btn" id="btWalk">Walk-forward (honest accuracy)</button>
+      </div>
+      <div id="btOut"></div>
+      <div id="btWalkOut" style="margin-top:10px"></div>
+    </section>
+
+    <!-- ================= FEED ================= -->
+    <section class="panel" id="tab-feed">
+      <div id="fdiag-line" class="list"></div>
+      <div class="statgrid" id="fdiag"></div>
+      <h3>Instruments detected</h3>
+      <table class="tbl" id="pairs"></table>
+      <h3>Protocol Lab</h3>
+      <p class="muted">Payloads the parser could not interpret. If your broker's feed shows up here, the shape is printed so the decoder can be extended — nothing is guessed silently.</p>
+      <div id="samples" class="log"></div>
+      <div class="row-btns">
+        <button class="btn" id="clrSamples">Clear samples</button>
+        <button class="btn" id="rstDiag">Reset counters</button>
+      </div>
+      <h3>Errors</h3>
+      <div id="errors" class="log"></div>
+    </section>
+
+    <!-- ================= SETTINGS ================= -->
+    <section class="panel" id="tab-settings">
+      <h3>Money &amp; risk</h3>
+      <div class="formrow">
+        <label>Balance<input id="sBal" type="number" min="1" step="1" /></label>
+        <label>Risk %<input id="sRisk" type="number" min="0.1" max="25" step="0.1" /></label>
+        <label>Payout %<input id="sPay" type="number" min="10" max="200" step="1" /></label>
+      </div>
+      <label class="check"><input id="sAuto" type="checkbox" /> Record paper trades automatically</label>
+      <label class="check"><input id="sDesk" type="checkbox" /> Desktop notifications for signals</label>
+      <label class="check"><input id="sSound" type="checkbox" /> Play a sound on signal</label>
+
+      <h3>Strategy</h3>
+      <div class="formrow">
+        <label>Min score<input id="sMinScore" type="number" min="1" max="12" /></label>
+        <label>Min payout %<input id="sMinPay" type="number" min="0" max="200" /></label>
+        <label>Cooldown (s)<input id="sCd" type="number" min="0" step="30" /></label>
+      </div>
+      <div class="formrow">
+        <label>Max volatility<input id="sMaxVol" type="number" min="0.0001" step="0.0001" /></label>
+        <label>Gate lookback<input id="sGateN" type="number" min="5" max="100" /></label>
+        <label>Max loss streak<input id="sStreak" type="number" min="0" max="20" /></label>
+      </div>
+      <label class="check"><input id="sMtf" type="checkbox" /> Multi-timeframe confirmation (5m / 15m)</label>
+      <label class="check"><input id="sPat" type="checkbox" /> Candlestick patterns</label>
+      <label class="check"><input id="sLvl" type="checkbox" /> Support / resistance levels</label>
+      <label class="check"><input id="sGate" type="checkbox" /> Stop trading below break-even win rate</label>
+      <button class="btn" id="sSave">Save settings</button>
+
+      <h3>Fallback feeds</h3>
+      <label class="check"><input id="sBinance" type="checkbox" /> Poll Binance public klines (crypto)</label>
+      <label class="check"><input id="sYahoo" type="checkbox" /> Poll Yahoo FX (delayed proxy)</label>
+
+      <h3>Run on another site</h3>
+      <p class="muted">Quotex mirrors change domain often. Grant access to the site you use and the feed hook is installed there — no <code>&lt;all_urls&gt;</code> permission needed.</p>
+      <div class="formrow">
+        <label style="flex:1">Origin<input id="sOrigin" type="text" placeholder="https://your-mirror.example" /></label>
+        <button class="btn" id="sGrant">Grant &amp; install</button>
+      </div>
+      <div id="grantOut" class="muted"></div>
+      <div class="row-btns">
+        <button class="btn" id="sOpenOpts">Full options page</button>
+        <button class="btn danger" id="sReset">Reset all settings</button>
+      </div>
+
+      <p class="disc">Q-Sync Pro is an analysis tool. It never places, clicks or confirms a trade. Binary options are a negative-expectation product for most participants — the journal and backtester exist so you can measure that for yourself before risking money.</p>
+    </section>
+  </main>
+
+  <script type="module" src="panel.js"></script>
+</body>
+</html>

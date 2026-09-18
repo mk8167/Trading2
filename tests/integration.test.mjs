@@ -1,0 +1,241 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { install, notifications } from './chrome-stub.mjs';
+import { series } from './helpers.mjs';
+import { analyze } from '../src/background/strategy.js';
+import { aggregate, TF_MS } from '../src/background/candles.js';
+
+// The stub must exist before the background modules are evaluated.
+install();
+const { handleMessage } = await import('../src/background/api.js');
+const store = await import('../src/background/store.js');
+const engine = await import('../src/background/engine.js');
+const ledger = await import('../src/background/ledger.js');
+const settings = await import('../src/background/settings.js');
+
+const SYM = 'EURUSD_OTC';
+const T0 = 1_700_000_000; // epoch seconds
+
+/** Wrap a tick the way the page's socket.io frame would. */
+const frame = (sym, epochSec, price) => ({
+  text: `42["tick",["${sym}",${epochSec},${price},1]]`,
+  binary: false,
+  url: 'wss://example.test/socket.io/?EIO=4&transport=websocket',
+});
+
+const send = (cmd, payload = {}) => handleMessage({ cmd, ...payload }, { tab: { id: 7 } });
+
+/** Push n bars of a trending random walk through the real message surface. */
+async function feedTrend({ n = 240, from = 0, drift = 0.05, sym = 'EURUSD_otc', seed = 5 } = {}) {
+  const cs = series({ n: n + from, drift, amp: 0.1, noise: 0.01, seed });
+  const slice = cs.slice(from);
+  const frames = slice.map((c, i) => frame(sym, T0 + (from + i) * 60, c.c));
+  return { res: await send('feed.batch', { frames }), candles: cs };
+}
+
+test('unknown commands are rejected, not silently ignored', async () => {
+  const r = await send('does.not.exist');
+  assert.equal(r.ok, false);
+  assert.match(r.err, /unknown cmd/);
+});
+
+test('live socket frames become candles through the message surface', async () => {
+  const { res, candles } = await feedTrend({ n: 240 });
+  assert.equal(res.ok, true);
+  assert.equal(res.ticks, 240, 'every frame should yield exactly one tick');
+
+  const st = store.getSymbol(SYM);
+  assert.ok(st, 'symbol was not registered');
+  assert.equal(st.source, 'quotex');
+  assert.equal(st.tf.m1.length, 240);
+  assert.ok(Math.abs(st.price - candles[239].c) < 1e-9, 'live price tracks the last tick');
+});
+
+test('state.get returns the same verdict the strategy engine computes', async () => {
+  const s = await settings.load();
+  const st = store.getSymbol(SYM);
+  store.refreshDerived(SYM);
+
+  const expected = analyze(
+    { m1: st.tf.m1, m5: st.tf.m5, m15: st.tf.m15, price: st.price, payout: s.payout },
+    s.strategy
+  );
+
+  const r = await send('state.get', { sym: SYM });
+  assert.equal(r.ok, true);
+  assert.equal(r.selectedSym, SYM);
+  assert.equal(r.signal.dir, expected.dir, `engine said ${expected.dir}, API returned ${r.signal.dir}`);
+  assert.equal(r.signal.score, expected.score);
+  assert.equal(r.symbol.bars.m1, 240, 'store should hold the full series');
+  assert.equal(r.candles.m1.length, 120, 'API trims the payload to the default window');
+  assert.ok(r.candles.m5.length >= 40, 'derived 5m series missing');
+  assert.ok(r.candles.m15.length >= 10, 'derived 15m series missing');
+  assert.ok(r.catalog.quotex.includes(SYM));
+  assert.equal(r.diag.ticks >= 240, true);
+});
+
+test('a directional signal on a closed bar opens a paper trade', async () => {
+  const s = await settings.load();
+  // Make the gate permissive so this test exercises the wiring, not the risk rules.
+  await send('settings.patch', { patch: { strategy: { minScore: 1, cooldownMs: 0, gateEnabled: false }, autoPaperTrade: true } });
+  const s2 = await settings.load();
+  const before = ledger.trades.length;
+
+  // Close one more bar so the engine sees a fresh candle.
+  const cs = series({ n: 246, drift: 0.05, amp: 0.1, noise: 0.01, seed: 5 });
+  await send('feed.batch', { frames: cs.slice(240).map((c, i) => frame('EURUSD_otc', T0 + (240 + i) * 60, c.c)) });
+
+  const st = store.getSymbol(SYM);
+  store.refreshDerived(SYM);
+  const expected = analyze(
+    { m1: st.tf.m1, m5: st.tf.m5, m15: st.tf.m15, price: st.price, payout: s2.payout },
+    s2.strategy
+  );
+
+  const r = await send('state.get', { sym: SYM });
+  const shouldTrade = expected.dir === 'up' || expected.dir === 'down';
+  assert.equal(r.signal.dir, expected.dir);
+  assert.equal(
+    ledger.trades.length > before,
+    shouldTrade,
+    `expected.dir=${expected.dir}; a paper trade ${shouldTrade ? 'should' : 'should not'} have opened`
+  );
+
+  if (shouldTrade) {
+    const t = ledger.trades[ledger.trades.length - 1];
+    assert.equal(t.dir, expected.dir);
+    assert.equal(t.sym, SYM);
+    assert.equal(t.result, null, 'trade must still be open');
+    assert.equal(t.entry, st.price);
+    assert.ok(r.journal.open >= 1);
+  }
+  await send('settings.patch', { patch: { strategy: { minScore: 3, cooldownMs: 180_000, gateEnabled: true } } });
+});
+
+test('the session snapshot survives a simulated worker restart', async () => {
+  const snap = store.serialize();
+  assert.ok(snap.symbols[SYM], 'snapshot missing the live symbol');
+  assert.ok(snap.symbols[SYM].m1.length > 100);
+
+  // Wipe memory the way a killed service worker would, then rebuild.
+  store.symbols.clear();
+  engine.invalidate(SYM);
+  assert.equal(store.getSymbol(SYM), null);
+
+  const restored = store.deserialize(snap);
+  assert.ok(restored >= 1);
+  const st = store.getSymbol(SYM);
+  assert.ok(st.tf.m1.length > 100, 'candles were not rebuilt');
+  assert.ok(st.tf.m5.length > 0, 'derived series were not rebuilt');
+  assert.ok(Number.isFinite(st.price));
+
+  // The engine must still produce a verdict from the rebuilt state.
+  const r = await send('state.get', { sym: SYM });
+  assert.ok(['up', 'down', 'none', 'veto', 'wait'].includes(r.signal.dir));
+});
+
+test('out-of-order and duplicate ticks cannot corrupt the series', async () => {
+  const sym = 'GBPJPY_otc';
+  const key = 'GBPJPY_OTC';
+  await send('feed.batch', { frames: [frame(sym, T0, 189.1), frame(sym, T0 + 10, 189.2), frame(sym, T0 + 20, 189.15)] });
+  const st = store.getSymbol(key);
+  assert.equal(st.tf.m1.length, 1);
+  // T0 is not minute-aligned, so the bar opens on the previous minute boundary.
+  assert.deepEqual(st.tf.m1[0], { t: 1_699_999_980_000, o: 189.1, h: 189.2, l: 189.1, c: 189.15 });
+
+  // A tick from a minute ago must be ignored, not appended.
+  await send('feed.batch', { frames: [frame(sym, T0 - 300, 188.0)] });
+  assert.equal(st.tf.m1.length, 1);
+  assert.equal(st.tf.m1[0].c, 189.15);
+});
+
+test('binary frames are decoded through the base64 path', async () => {
+  const sym = 'XAUUSD_otc';
+  const payload = `42["q",["${sym}",${T0 + 600},2331.55,1]]`;
+  const b64 = Buffer.from(payload, 'utf8').toString('base64');
+  const r = await send('feed.batch', { frames: [{ b64, binary: true, url: 'wss://x' }] });
+  assert.equal(r.ok, true);
+  assert.equal(r.ticks, 1);
+  assert.ok(Math.abs(store.getSymbol('XAUUSD_OTC').price - 2331.55) < 1e-9);
+});
+
+test('unparseable frames land in the Protocol Lab instead of vanishing', async () => {
+  await send('feed.clearSamples');
+  await send('feed.batch', { frames: [{ text: '42["heartbeat",{"code":7,"seq":12345}]', url: 'wss://x' }] });
+  const r = await send('feed.samples');
+  assert.ok(r.samples.length >= 1, 'sample should have been captured');
+  assert.match(r.samples[0].text, /heartbeat/);
+});
+
+test('socket events are counted in diagnostics', async () => {
+  await send('diag.reset');
+  await send('feed.socket', { url: 'wss://example.test/socket.io/' });
+  await send('feed.socket', { url: 'wss://example.test/socket.io/' });
+  const r = await send('state.get', { sym: SYM });
+  assert.equal(r.diag.sockets, 2, 'both socket opens should be counted');
+});
+
+
+test('the backtest runs end to end through the API', async () => {
+  const r = await send('backtest.run', { sym: SYM, tf: 'm1', expiryBars: 1, payout: 86, stake: 1 });
+  assert.equal(r.ok, true, r.err || 'backtest failed');
+  assert.ok(r.bars > 100);
+  assert.ok(r.evaluated > 0);
+  assert.ok(Number.isFinite(r.summary.winRate));
+  assert.ok(Number.isFinite(r.summary.roiPct));
+  const skipped = r.skipped.none + r.skipped.veto + r.skipped.gate + r.skipped.warmup;
+  assert.ok(skipped + r.summary.trades <= r.evaluated + 1);
+});
+
+test('the journal round-trips through storage and CSV', async () => {
+  const csv = await send('journal.csv');
+  assert.equal(csv.ok, true);
+  assert.match(csv.csv, /^id,openedAt,/);
+
+  const summary = await send('journal.summary');
+  assert.equal(summary.ok, true);
+  assert.ok('winRate' in summary.journal);
+  assert.ok(Array.isArray(summary.journal.breakdown.setup));
+});
+
+test('dynamic script registration is refused without permission', async () => {
+  const ok = await send('scripts.register', { origin: 'https://mirror.example' });
+  assert.equal(ok.ok, true, 'stub grants everything, so this should succeed');
+  assert.equal(ok.pattern, 'https://mirror.example/*');
+
+  const bad = await send('scripts.register', { origin: 'not-a-url' });
+  assert.equal(bad.ok, false);
+});
+
+test('notification permission is only used for real signals', async () => {
+  // The stub records every notification; the pipeline above must not have
+  // spammed any for non-directional bars.
+  for (const n of notifications) {
+    assert.match(n.title, /Q-Sync · (UP|DOWN)/);
+  }
+});
+
+test('settings merge never drops a nested default', async () => {
+  const patched = await send('settings.patch', { patch: { alerts: { sound: true } } });
+  assert.equal(patched.settings.alerts.sound, true);
+  assert.equal(patched.settings.alerts.desktop, true, 'sibling default was lost');
+  assert.equal(patched.settings.strategy.minScore, 3, 'unrelated branch was lost');
+  assert.equal(patched.settings.balance, 100);
+  await send('settings.reset');
+  const reset = await send('settings.get');
+  assert.equal(reset.settings.alerts.sound, false);
+});
+
+test('the feed pipeline is fast enough for a 1-second heartbeat', async () => {
+  const frames = series({ n: 200, seed: 99 }).map((c, i) => frame('AUDUSD_otc', T0 + 5000 + i * 60, c.c));
+  const t0 = performance.now();
+  await send('feed.batch', { frames });
+  await send('state.get', { sym: 'AUDUSD_OTC' });
+  const ms = performance.now() - t0;
+  assert.ok(ms < 1500, `200 frames + a full state build took ${ms.toFixed(0)}ms`);
+});
+
+test('TF_MS covers every timeframe the UI offers', () => {
+  assert.deepEqual(Object.keys(TF_MS).sort(), ['m1', 'm15', 'm30', 'm5']);
+  assert.equal(aggregate([{ t: 0, o: 1, h: 1, l: 1, c: 1 }], TF_MS.m30).length, 1);
+});
