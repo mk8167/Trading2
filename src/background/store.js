@@ -53,6 +53,15 @@ const protectedSyms = new Set();
 export const diag = {
   frames: 0,
   ticks: 0,
+  /**
+   * Prices that arrived over the broker's own socket.
+   *
+   * diag.ticks counts every stored price, REST proxies included, so it cannot
+   * answer "is the broker socket working?" — the question the user is really
+   * asking when their chart disagrees with the site's. This one only ever
+   * moves from a decoded frame on a hooked page.
+   */
+  brokerTicks: 0,
   historyRows: 0,
   /** How many history blocks have been stored, and how they were filed. */
   historyBlocks: 0,
@@ -84,6 +93,7 @@ export const diag = {
 export function resetDiag() {
   diag.frames = 0;
   diag.ticks = 0;
+  diag.brokerTicks = 0;
   diag.historyRows = 0;
   diag.historyBlocks = 0;
   diag.brokerRows = 0;

@@ -326,3 +326,118 @@ test('the heartbeat hands the watched pair to both fallbacks', () => {
 });
 
 globalThis.fetch = realFetch;
+
+/* ------------- saying WHY the broker is not in the picture --------------- */
+
+/*
+ * The screenshot that produced this section: the site's chart on screen was
+ * ticking on GBP/USD while the panel reported "yahoo feed" and the note beside
+ * the picker said "the site does not stream this pair". The site WAS streaming
+ * it. The truth was that the extension had never seen a single broker frame on
+ * that page — the hook had not been injected on that domain — and the pair
+ * explanation, correct on its own, was being read as an explanation of the
+ * whole page. Three hook states have to be distinguishable in words, because
+ * the fix differs: grant the domain, read the Protocol Lab, or nothing at all.
+ */
+
+test('with no broker socket seen, a proxy pair says so and names the fix', () => {
+  clearStore();
+  store.ingestTick('BTCUSD', 60000, Date.now(), 'binance'); // non-stale proxy
+  const d = select.describe('BTCUSD');
+
+  assert.equal(d.reason, 'proxy-live');
+  assert.equal(d.hook, 'absent');
+  assert.match(d.text, /yahoo|binance/i, 'the pair-level sentence must survive');
+  assert.match(d.text, /nothing from the broker reaches/i);
+  assert.match(d.text, /Grant & install|Site access/, 'the fix has to be in the sentence');
+  assert.doesNotMatch(d.text, /does not stream this pair/, 'must not blame the site for our own missing hook');
+});
+
+test('a socket with no decodable prices reads as silent, not as absent', () => {
+  clearStore();
+  store.diag.sockets = 2; // the hook is running…
+  store.diag.brokerTicks = 0; // …but not one broker price came out of it
+  store.ingestTick('BTCUSD', 60000, Date.now(), 'binance');
+
+  const d = select.describe('BTCUSD');
+  assert.equal(d.hook, 'silent');
+  assert.match(d.text, /Protocol Lab/, 'a decode failure is investigated in one place');
+  assert.doesNotMatch(d.text, /Grant & install/, 'the domain is already working; granting it again is not the fix');
+});
+
+test('when broker frames are flowing, the pair note stays about the pair', () => {
+  clearStore();
+  store.diag.sockets = 1;
+  store.diag.brokerTicks = 900;
+  store.ingestTick('BTCUSD', 60000, Date.now(), 'binance');
+
+  const d = select.describe('BTCUSD');
+  assert.equal(d.hook, 'live');
+  assert.doesNotMatch(d.text, /reaches this extension/);
+  assert.doesNotMatch(d.text, /Protocol Lab/);
+});
+
+test('a REST price must never make a dead hook look alive', () => {
+  // diag.ticks is bumped by every stored price, REST proxies included. Reading
+  // the hook state from it would let the Binance/yahoo pollers "prove" the
+  // broker socket is decoding — the exact confusion this diagnosis exists to
+  // remove, since a page with a dead hook always has fresh proxy data.
+  clearStore();
+  store.diag.sockets = 1;
+  store.ingestTick('BTCUSD', 60000, Date.now(), 'binance'); // REST tick only
+  assert.ok(store.diag.ticks > 0, 'the proxy tick is counted in ticks…');
+
+  const d = select.describe('BTCUSD');
+  assert.equal(d.hook, 'silent', '…but it says nothing about the broker socket');
+
+  // The broker's own candles count as proof just like its ticks do.
+  store.diag.brokerRows = 1;
+  assert.equal(select.describe('BTCUSD').hook, 'live');
+});
+
+test('a live broker pair never carries a hook lecture', () => {
+  clearStore(); // sockets deliberately 0: the hook state is irrelevant here
+  store.ingestTick('EURUSD_OTC', 1.1, Date.now(), 'quotex');
+  const d = select.describe('EURUSD_OTC');
+  assert.equal(d.reason, 'broker-live');
+  assert.doesNotMatch(d.text, /reaches this extension|Grant & install|Protocol Lab/);
+});
+
+test('a broker-owned pair that has gone quiet still explains the missing hook', () => {
+  clearStore();
+  store.ingestTick('GBPUSD', 1.3, T0, 'quotex'); // stale: the broker owned it, then stopped
+  const d = select.describe('GBPUSD');
+  assert.equal(d.reason, 'broker-idle');
+  assert.equal(d.hook, 'absent');
+  assert.match(d.text, /reaches this extension|Grant & install|Site access/);
+});
+
+/* ------------- the payload the UI actually receives --------------------- */
+
+const send = (cmd, payload = {}) => handleMessage({ cmd, ...payload }, { tab: { id: 7 } });
+
+test('state.get tells the UI a delayed proxy is delayed, with how far behind', async () => {
+  clearStore();
+  const settings = await import('../src/background/settings.js');
+  await settings.load();
+  settings.patch({ simNow: null, selectedSym: 'BTCUSD' });
+  stubFetch(anyFeed(40));
+
+  const now = Date.now();
+  // A bar whose close is a quarter of an hour in the past: exactly the Yahoo
+  // 1-minute case from the bug report.
+  store.ingestTick('BTCUSD', 60000, now - 16 * 60_000, 'binance');
+  store.refreshDerived('BTCUSD');
+
+  const r = await send('state.get', { sym: 'BTCUSD' });
+  assert.equal(r.sync.delayed, true, 'a REST-sourced series must not be presented as the site clock');
+  assert.ok(r.sync.dataAgeSec >= 15 * 60, `expected a ~15-minute delay, got ${r.sync.dataAgeSec}s`);
+
+  // The broker's own series is the opposite case.
+  store.ingestTick('EURUSD_OTC', 1.1, now, 'quotex');
+  store.diag.sockets = 1;
+  store.diag.brokerTicks++;
+  const q = await send('state.get', { sym: 'EURUSD_OTC' });
+  assert.equal(q.sync.delayed, false, 'broker data is the reference clock, not a delayed copy');
+  globalThis.fetch = realFetch;
+});

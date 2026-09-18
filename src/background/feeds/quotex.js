@@ -47,7 +47,13 @@ export function handleFrame(frame) {
     const r = extract(trimmed);
 
     for (const t of r.ticks) {
-      if (store.ingestTick(t.sym, t.price, t.ts, 'quotex')) out.ticks++;
+      // diag.ticks counts every price the extension stores, REST proxies
+      // included, so it cannot answer "is the broker socket decoding?".
+      // This counter can: only frames from the hooked page reach this line.
+      if (store.ingestTick(t.sym, t.price, t.ts, 'quotex')) {
+        out.ticks++;
+        store.diag.brokerTicks++;
+      }
     }
     for (const h of r.history) {
       // The timeframe is measured from the block itself, so a 5- or 15-minute

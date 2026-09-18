@@ -384,3 +384,26 @@ test('the m15 selection shows m15 candles, not 1-minute ones', () => {
   // 15m bars: the countdown must be minutes away, not a rolling 60 seconds.
   assert.ok(Number(sh.getElementById('clk').textContent.replace('s', '')) > 60, 'm15 clock, not the m1 clock');
 });
+
+test('a delayed proxy gets no countdown on the floating widget', () => {
+  // The HUD's clock is the number the user glances at before tapping a
+  // 1-minute expiry. On a delayed REST copy the newest bar closed minutes ago,
+  // so a rolling countdown there is a clock for a bar that no longer exists.
+  const state = liveState();
+  state.sync = { source: 'yahoo', delayed: true, dataAgeSec: 900, aligned: false, barsFrom: 'ticks' };
+  const { shadow } = makePage({ state });
+  const sh = shadow();
+
+  assert.equal(sh.getElementById('clk').textContent, 'delay');
+  assert.match(sh.getElementById('clk').title, /delayed proxy/i);
+  assert.match(sh.getElementById('meta').textContent, /delayed/, 'the source line says so too');
+});
+
+test('a live broker series keeps its countdown', () => {
+  const state = liveState();
+  state.sync = { source: 'quotex', delayed: false, aligned: true, barsFrom: 'broker' };
+  const { shadow } = makePage({ state });
+  const sh = shadow();
+  assert.match(sh.getElementById('clk').textContent, /^(\d+)s$|^close$/);
+  assert.doesNotMatch(sh.getElementById('meta').textContent, /delayed/);
+});

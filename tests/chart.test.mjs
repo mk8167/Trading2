@@ -379,3 +379,45 @@ test('a chart of flat prices does not divide by zero', () => {
   }
   for (const t of log.text) assert.ok(!/NaN|Infinity/.test(t.t), `axis label is ${t.t}`);
 });
+
+/* ------------------------------- axis clock ------------------------------- */
+
+/*
+ * The site's chart is drawn in UTC and says so next to its clock; this one drew
+ * local time. On a UTC+6 machine the same 1-minute bar was labelled 06:48 by
+ * the broker and 12:48 by the panel, which made it impossible to see how far
+ * behind a delayed proxy actually was — the one comparison the panel exists to
+ * support.
+ *
+ * The timezone is forced here so the test cannot pass by accident on a machine
+ * that happens to run in UTC, which is exactly how the bug survived.
+ */
+test('the time axis is UTC even when the machine is not', () => {
+  const realTz = process.env.TZ;
+  process.env.TZ = 'Asia/Dhaka'; // UTC+6
+  try {
+    const hour = 6; // a UTC morning hour the site would print as "06:xx"
+    const t0 = Date.UTC(2026, 8, 18, hour, 0);
+    const { log } = chart({
+      candles: Array.from({ length: 60 }, (_, i) => ({
+        t: t0 + i * 60_000, o: 1.1 + i * 1e-5, h: 1.1004 + i * 1e-5, l: 1.0996 + i * 1e-5, c: 1.1 + i * 1e-5,
+      })),
+    });
+
+    const labels = log.text.map((x) => x.t).filter((t) => /^\d\d:\d\d$/.test(t));
+    assert.ok(labels.length >= 3, `expected time labels, got ${JSON.stringify(log.text.map((x) => x.t))}`);
+    assert.ok(labels.includes(`${String(hour).padStart(2, '0')}:00`), `first label must be the UTC minute, got ${labels[0]}`);
+    assert.ok(
+      labels.every((l) => Number(l.slice(0, 2)) < 12),
+      `no label may be in local time: ${labels.join(', ')}`
+    );
+  } finally {
+    if (realTz === undefined) delete process.env.TZ;
+    else process.env.TZ = realTz;
+  }
+});
+
+test('the axis timezone is exported for the UI to print', async () => {
+  const { AXIS_TZ_LABEL } = await import('../src/ui/chart.js');
+  assert.equal(AXIS_TZ_LABEL, 'UTC');
+});

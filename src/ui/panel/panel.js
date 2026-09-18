@@ -7,7 +7,7 @@
  * frame can never leave stale numbers on screen.
  * ----------------------------------------------------------------*/
 
-import { CandleChart } from '../chart.js';
+import { CandleChart, AXIS_TZ_LABEL } from '../chart.js';
 import { ema, adx } from '../../background/indicators.js';
 import { formatPrice, TF_MS } from '../../background/candles.js';
 import { breakEvenWinRate } from '../../background/strategy.js';
@@ -76,9 +76,11 @@ const chart = new CandleChart($('chart'), {
       tip.textContent = '';
       return;
     }
+    // UTC to match the axis and the broker's chart — a tooltip in a different
+    // timezone than the ticks under it is a bug with a straight face.
     const d = new Date(h.t);
-    const hh = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
-    tip.textContent = `${hh}  O ${formatPrice(h.o)}  H ${formatPrice(h.h)}  L ${formatPrice(h.l)}  C ${formatPrice(h.c)}`;
+    const hh = `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
+    tip.textContent = `${hh} ${AXIS_TZ_LABEL}  O ${formatPrice(h.o)}  H ${formatPrice(h.h)}  L ${formatPrice(h.l)}  C ${formatPrice(h.c)}`;
   },
 });
 
@@ -298,7 +300,11 @@ function renderSignal(d) {
   const lastBar = cs[cs.length - 1];
   const ms = TF_MS[tf] || TF_MS.m1;
   const rem = lastBar ? Math.max(0, Math.ceil((lastBar.t + ms - d.now) / 1000)) : 0;
-  $('clock').textContent = rem > 0 ? `${rem}s to close` : 'closing…';
+  // A delayed proxy's newest bar closed minutes ago, so counting down to its
+  // "close" invents an expiry the site's chart does not have.
+  $('clock').textContent = d.sync?.delayed
+    ? 'delayed proxy clock'
+    : rem > 0 ? `${rem}s to close` : 'closing…';
 }
 
 function renderChartTab(d) {
@@ -312,30 +318,54 @@ function renderChartTab(d) {
   $('readout').textContent = cs.length
     ? `${cs.length} bars · ${pretty(d.selectedSym)} · ${d.symbol?.source || '?'} feed · ${
         d.symbol?.stale ? 'STALE' : 'live'
-      }${sy0.barsFrom === 'broker' ? ` · from the site's own ${tf} candles` : ''}`
+      } · axis ${AXIS_TZ_LABEL}${sy0.barsFrom === 'broker' ? ` · from the site's own ${tf} candles` : ''}`
     : 'no bars yet';
 
   // Forming preview (early warning) + candle-sync health.
+  const sy = d.sync;
+  const delayed = !!sy?.delayed;
+  // On a REST proxy the countdown is the proxy's clock, not the site's, and on
+  // a delayed one the newest bar can be a quarter of an hour old, so "45s to
+  // close" would be a confident statement about a bar that closed long ago.
+  // Binance's crypto feed is live and Yahoo's is ~15 minutes behind, so the
+  // wording follows the measured age rather than guessing from the source.
+  const ageSec = sy?.dataAgeSec ?? null;
+  const behindMin = ageSec != null && ageSec >= 120 ? Math.max(1, Math.round(ageSec / 60)) : null;
+  const clockNote = delayed
+    ? behindMin
+      ? `delayed ${sy?.source || 'proxy'} copy ~${behindMin}m behind — not the site's clock`
+      : `${sy?.source || 'proxy'} proxy, not the site's own feed`
+    : `<b>confirm at close</b> (${d.secondsToClose ?? '—'}s)`;
   const pv = d.preview;
   let pvHtml = '';
   if (pv && (pv.dir === 'up' || pv.dir === 'down')) {
     pvHtml = `<div class="i ${pv.dir === 'up' ? 'ok' : ''}">⚡ FORMING ${pv.dir === 'up' ? 'UP' : 'DOWN'} · conf ${
       pv.confidence
-    } — <b>confirm at close</b> (${d.secondsToClose ?? '—'}s). This is a preview, not the trade call.</div>`;
+    } — ${clockNote}. This is a preview, not the trade call.</div>`;
   } else if (pv) {
-    pvHtml = `<div class="i">forming: ${esc(pv.summary || 'no edge yet')} · ${d.secondsToClose ?? '—'}s to close</div>`;
+    pvHtml = `<div class="i">forming: ${esc(pv.summary || 'no edge yet')} · ${
+      delayed ? clockNote : `${d.secondsToClose ?? '—'}s to close`
+    }</div>`;
   }
-  const sy = d.sync;
   let syncHtml = '';
   if (sy) {
     const own = sy.barsFrom === 'broker';
-    syncHtml = sy.aligned
-      ? `<div class="i ok">candle sync ✓ — ${esc(sy.source)} feed, bar aligned to the ${
-          tf === 'm1' ? 'minute' : tf
-        }${own ? `, drawn from the broker's own ${tf} candles` : ''}</div>`
-      : `<div class="i">candle sync ✗ — ${esc(sy.source)} feed${sy.tickAgeSec != null ? `, last tick ${sy.tickAgeSec}s ago` : ''}${
-          sy.aligned === false ? ', bar NOT on the timeframe boundary' : ''
-        }. If this is a proxy feed, it will not match the broker chart.</div>`;
+    if (delayed) {
+      // The boundary check and the countdown both assume the site's bar clock.
+      // On a proxy they print a wrong number with confidence, so what is shown
+      // instead is what is actually measurable: the age of the newest bar.
+      syncHtml = behindMin
+        ? `<div class="i">delayed ${esc(sy.source)} copy — newest bar ~${behindMin}m behind the site. Bar boundaries and the countdown above run on the proxy's clock, not the broker's; treat the call as indicative only.</div>`
+        : `<div class="i">${esc(sy.source)} proxy — this is not the broker's own feed, so bar boundaries and the countdown above are the proxy's clock rather than the site's.</div>`;
+    } else {
+      syncHtml = sy.aligned
+        ? `<div class="i ok">candle sync ✓ — ${esc(sy.source)} feed, bar aligned to the ${
+            tf === 'm1' ? 'minute' : tf
+          }${own ? `, drawn from the broker's own ${tf} candles` : ''}</div>`
+        : `<div class="i">candle sync ✗ — ${esc(sy.source)} feed${sy.tickAgeSec != null ? `, last tick ${sy.tickAgeSec}s ago` : ''}${
+            sy.aligned === false ? ', bar NOT on the timeframe boundary' : ''
+          }. If this is a proxy feed, it will not match the broker chart.</div>`;
+    }
     // The chart on screen and the series the strategy reads are not always the
     // same, and pretending otherwise would let the user read a 5-minute chart
     // as if the call beside it had been made on 5-minute closes.
@@ -468,7 +498,7 @@ function renderSignalTab(d) {
     ['Volatility', sig.ctx?.volatility != null ? (sig.ctx.volatility * 100).toFixed(3) + '%' : '—'],
     ['RSI', sig.ctx?.rsi != null ? sig.ctx.rsi.toFixed(1) : '—'],
     ['Candles used', sig.ctx?.candles ?? '—'],
-    ['Bar close', sig.ctx?.at ? new Date(sig.ctx.at).toLocaleTimeString() : '—'],
+    ['Bar close', sig.ctx?.at ? clock(sig.ctx.at) + ' ' + AXIS_TZ_LABEL : '—'],
   ]);
 
   const vetoes = sig.vetoes || [];
@@ -559,7 +589,7 @@ function renderJournal(d) {
 
   const rows = (j.recent || []).slice(0, 25);
   $('trades').innerHTML = rows.length
-    ? `<tr><th>Time</th><th>Pair</th><th>Dir</th><th>Entry</th><th>Exit</th><th>P/L</th><th>Setup</th></tr>` +
+    ? `<tr><th>Time (UTC)</th><th>Pair</th><th>Dir</th><th>Entry</th><th>Exit</th><th>P/L</th><th>Setup</th></tr>` +
       rows
         .map(
           (t) => `<tr>
@@ -597,12 +627,59 @@ function parsePaths(methods) {
   return rows.length ? rows.map(([k, v]) => `${k} ${v}`).join(' · ') : '—';
 }
 
+/*
+ * Chrome only reports a tab's address to an extension that already has host
+ * access to that page. That single fact separates the two causes of "no broker
+ * frames at all" — a domain that was never granted, and a granted domain whose
+ * socket this extension still cannot see — and the panel is the only surface
+ * that can ask. Cached, because the answer changes only when the user switches
+ * tab or grants a domain, and the panel re-renders on every tick.
+ */
+const activeOrigin = { value: '', busy: false };
+function refreshActiveOrigin() {
+  if (activeOrigin.busy) return;
+  activeOrigin.busy = true;
+  try {
+    Promise.resolve(chrome.tabs?.query?.({ active: true, lastFocusedWindow: true }))
+      .then(([tab]) => {
+        activeOrigin.value = tab?.url ? new URL(tab.url).origin : '';
+      })
+      .catch(() => {
+        activeOrigin.value = '';
+      })
+      .finally(() => {
+        activeOrigin.busy = false;
+      });
+  } catch {
+    activeOrigin.value = '';
+    activeOrigin.busy = false;
+  }
+}
+
+/**
+ * The two ways to see no broker socket at all need opposite fixes: a domain
+ * that was never granted (grant it) and a granted domain whose socket this
+ * extension still cannot see (reload it, then look for a Web Worker). The
+ * difference is whether Chrome is willing to tell us the page's address, and
+ * only the panel can ask — so this branch pays for one tabs.query, and only
+ * while the feed is completely dead.
+ */
+function noSocketVerdict() {
+  refreshActiveOrigin();
+  return activeOrigin.value
+    ? `No WebSocket seen on this page, but this extension DOES have access to ${activeOrigin.value} — the hook is installed and simply found no socket. The site may open it inside a Web Worker, or this page loaded before the hook was installed: reload it and watch "Sockets seen".`
+    : 'No WebSocket seen on this page, and Chrome will not even show this extension the page address — it has no access here. If this is a mirror domain, grant it in Options → Site access (or Settings → "Grant & install") and reload.';
+}
+
 function renderFeed(d) {
   const g = d.diag || {};
   $('fdiag').innerHTML = [
     ['Sockets seen', g.sockets ?? 0, 'WebSocket opens on this page'],
     ['Frames', g.frames ?? 0, 'websocket payloads'],
-    ['Ticks', g.ticks ?? 0, 'parsed prices'],
+    ['Ticks', g.ticks ?? 0, 'parsed prices, all feeds'],
+    // The number that decides whether the site's chart and this one can ever
+    // agree: 0 here means the broker socket has never produced a price.
+    ['Broker ticks', g.brokerTicks ?? 0, 'prices from the site\'s own socket'],
     ['History rows', g.historyRows ?? 0, `candles seeded in ${g.historyBlocks ?? 0} block(s)`],
     // The broker's own candles, per timeframe. A pair with ticks but no broker
     // candles is a pair whose chart the broker never sent — a different
@@ -630,17 +707,31 @@ function renderFeed(d) {
     .join('');
 
   // One-line "why is/isn't this live" diagnosis.
-  const live = (d.symbols || []).some((s) => !s.stale);
-  const verdict = live
-    ? `✓ LIVE — ticks every frame on ${(d.symbols || []).filter((s) => !s.stale).length} instrument(s).`
-    : (g.ticks > 0)
-      ? 'Feed is connected; waiting for enough closed candles.'
-      : (g.frames > 0)
-        ? 'Frames arrive but are not decoded — open the Protocol Lab below to see the payload shape.'
-        : (g.sockets > 0)
-          ? 'A WebSocket opened but its frames are not visible — the socket may live in a Web Worker.'
-          : 'No WebSocket seen on this page. If this is a mirror domain, grant it in Options → Site access and reload.';
-  $('fdiag-line').innerHTML = `<div class="i ${live ? 'ok' : ''}">${esc(verdict)}</div>`;
+  //
+  // "LIVE" has to mean the BROKER is live. A page whose only data is a delayed
+  // REST proxy still has plenty of non-stale symbols — every Binance pair
+  // refreshes every 30 s — and the old line called that "✓ LIVE — ticks every
+  // frame" on a page where not one broker frame had ever arrived. That single
+  // word is what made a dead hook look like a working feed.
+  const syms = d.symbols || [];
+  const liveBroker = syms.filter((s) => !s.stale && s.source === 'quotex').length;
+  const liveProxy = syms.filter((s) => !s.stale && s.source !== 'quotex').length;
+  const verdict = liveBroker
+    ? `✓ LIVE — broker ticks on ${liveBroker} instrument(s)${liveProxy ? `; ${liveProxy} more on REST proxies` : ''}.`
+    : liveProxy
+      ? `⚠ NOT LIVE — ${liveProxy} instrument(s) are refreshing, but every one of them is a REST proxy, not the broker's feed: not one broker frame has reached this extension${
+          g.sockets > 0
+            ? ' even though a broker WebSocket is open here (Protocol Lab below shows the raw shape).'
+            : ' because no broker WebSocket is visible on this page (mirror domain?). Settings → "Grant & install", then reload the tab.'
+        }`
+      : (g.brokerTicks ?? 0) > 0 || (g.brokerRows ?? 0) > 0
+        ? 'Feed is connected; waiting for enough closed candles.'
+        : g.frames > 0
+          ? 'Frames arrive but are not decoded — open the Protocol Lab below to see the payload shape.'
+          : g.sockets > 0
+            ? 'A WebSocket opened but its frames are not visible — the socket may live in a Web Worker.'
+            : noSocketVerdict();
+  $('fdiag-line').innerHTML = `<div class="i ${liveBroker ? 'ok' : ''}">${esc(verdict)}</div>`;
 
   const pairs = d.symbols || [];
   $('pairs').innerHTML = pairs.length
@@ -714,9 +805,15 @@ function kv(pairs) {
  * (BTCUSDT, 1000SHIBUSDT) was printed as one unreadable blob. */
 const pretty = prettySym;
 
+/**
+ * Timestamps are printed in UTC, the broker's own timezone — the one on the
+ * site's chart and in its trade history. A ledger in local time cannot be
+ * reconciled against the broker's history line by line, which is the whole
+ * point of keeping a ledger beside a live account.
+ */
 function clock(t) {
   const d = new Date(t);
-  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}:${String(d.getSeconds()).padStart(2, '0')}`;
+  return `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}:${String(d.getUTCSeconds()).padStart(2, '0')}`;
 }
 
 function esc(s) {
@@ -766,6 +863,16 @@ $('sReset').addEventListener('click', async () => {
 
 $('sOpenOpts').addEventListener('click', () => chrome.runtime.openOptionsPage?.());
 
+/*
+ * Installing the hook on a mirror domain the manifest does not list.
+ *
+ * The address of that page is exactly what Chrome will not tell us until the
+ * permission exists, so auto-detection legitimately comes up empty the first
+ * time — and saying "enter a full origin" there is a dead end dressed up as a
+ * form validation error. And because the bridge runs at document_start, a tab
+ * that is already open needs a reload before the feed can start; doing it here
+ * is the difference between "granted" and "granted and working".
+ */
 $('sGrant').addEventListener('click', async () => {
   let origin = $('sOrigin').value.trim();
   const out = $('grantOut');
@@ -775,7 +882,9 @@ $('sGrant').addEventListener('click', async () => {
       origin = tab?.url ? new URL(tab.url).origin : '';
     }
     if (!/^https?:\/\/[^/]+$/.test(origin)) {
-      out.textContent = 'Enter a full origin, e.g. https://example.com';
+      out.textContent = origin
+        ? 'Enter a full origin, e.g. https://example.com'
+        : 'Chrome withholds this page\'s address until the permission exists — that is what this button is for. Type the site address (e.g. https://broker.example) and press again.';
       return;
     }
     out.textContent = 'Requesting permission…';
@@ -785,7 +894,27 @@ $('sGrant').addEventListener('click', async () => {
       return;
     }
     const r = await send('scripts.register', { origin });
-    out.textContent = r.ok ? `Installed on ${r.pattern}. Reload that tab to start the feed.` : `Failed: ${r.err}`;
+    if (!r.ok) {
+      out.textContent = `Failed: ${r.err}`;
+      return;
+    }
+    let n = 0;
+    try {
+      const tabs = await chrome.tabs.query({ url: r.pattern });
+      for (const t of tabs) {
+        try {
+          await chrome.tabs.reload(t.id);
+          n++;
+        } catch {
+          /* a tab may close mid-loop */
+        }
+      }
+    } catch {
+      /* no tabs API here — the message below still tells the user what to do */
+    }
+    out.textContent = n
+      ? `Installed on ${r.pattern} and reloaded ${n} tab${n > 1 ? 's' : ''} — the feed starts as the chart loads.`
+      : `Installed on ${r.pattern}. Reload that tab to start the feed.`;
   } catch (e) {
     out.textContent = `Failed: ${e.message || e}`;
   }
@@ -844,7 +973,7 @@ $('btRun').addEventListener('click', async () => {
       Skipped — no signal: ${r.skipped.none}, vetoed: ${r.skipped.veto}, gated: ${r.skipped.gate}, warming: ${r.skipped.warmup}.
       This is in-sample on the candles currently in memory (${r.bars} bars), so treat it as a sanity check, not an edge.
     </p>
-    <table class="tbl"><tr><th>Time</th><th>Dir</th><th>Entry</th><th>Exit</th><th>Result</th><th>P/L</th><th>Setup</th></tr>
+    <table class="tbl"><tr><th>Time (UTC)</th><th>Dir</th><th>Entry</th><th>Exit</th><th>Result</th><th>P/L</th><th>Setup</th></tr>
       ${r.trades.slice(-30).reverse().map((t) => `<tr>
         <td>${clock(t.openedAt)}</td>
         <td class="${t.dir === 'up' ? 'pos' : 'neg'}">${t.dir === 'up' ? '▲' : '▼'}</td>

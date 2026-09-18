@@ -23,6 +23,13 @@ async function refreshHooks() {
     : '<tr><td class="muted">No dynamic hook installed — the built-in Quotex domains are covered by the manifest.</td></tr>';
 }
 
+/*
+ * Chrome only reveals a tab's address to an extension that already has host
+ * access to it. On a mirror domain — the exact case this whole page exists for
+ * — the URL comes back undefined, so auto-detection cannot work until the
+ * permission has been granted once. The message below has to say that, or the
+ * user is left typing an address and being told it is wrong.
+ */
 async function currentOrigin() {
   const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
   if (!tab?.url) return '';
@@ -33,17 +40,46 @@ async function currentOrigin() {
   }
 }
 
+const NO_URL_MSG =
+  'Chrome hides the address of a page this extension cannot access yet — which is exactly what you are here to fix. Type the site address (e.g. https://broker.example) and press Grant.';
+
 $('detect').addEventListener('click', async () => {
   const o = await currentOrigin();
-  if (!o || o === 'null') return out('The active tab has no usable origin (is it a chrome:// page?).', false);
+  if (!o || o === 'null') return out(NO_URL_MSG, false);
   $('origin').value = o;
   out(`Detected ${o}`);
 });
 
+/**
+ * Reload the tabs the hook was just installed on.
+ *
+ * The bridge runs at document_start, so a page that is already open will not
+ * pick it up until it is reloaded. Telling the user to do it themselves is how
+ * "granted, still no feed" reports happen; we have the permission now, so
+ * matching tabs are visible and can be reloaded here.
+ */
+async function reloadMatching(pattern) {
+  try {
+    const tabs = await chrome.tabs.query({ url: pattern });
+    for (const t of tabs) {
+      try {
+        await chrome.tabs.reload(t.id);
+      } catch {
+        /* a tab may close mid-loop; one failure must not stop the rest */
+      }
+    }
+    return tabs.length;
+  } catch {
+    return 0;
+  }
+}
+
 $('grant').addEventListener('click', async () => {
   let origin = $('origin').value.trim();
   if (!origin) origin = await currentOrigin();
-  if (!/^https?:\/\/[^/]+$/.test(origin)) return out('Enter a full origin such as https://example.com', false);
+  if (!/^https?:\/\/[^/]+$/.test(origin)) {
+    return out(origin ? 'Enter a full origin such as https://example.com' : NO_URL_MSG, false);
+  }
 
   out('Waiting for the permission prompt…');
   const granted = await chrome.permissions.request({ origins: [`${origin}/*`] });
@@ -51,7 +87,13 @@ $('grant').addEventListener('click', async () => {
 
   const r = await send('scripts.register', { origin });
   if (!r.ok) return out(`Installed the permission but the hook failed: ${r.err}`, false);
-  out(`Hook installed on ${r.pattern}. Reload that tab and the feed starts automatically.`, true);
+  const n = await reloadMatching(r.pattern);
+  out(
+    n
+      ? `Hook installed on ${r.pattern} and ${n} open tab${n > 1 ? 's were' : ' was'} reloaded — the feed starts as soon as the chart loads.`
+      : `Hook installed on ${r.pattern}. Reload that tab and the feed starts automatically.`,
+    true
+  );
   refreshHooks();
 });
 

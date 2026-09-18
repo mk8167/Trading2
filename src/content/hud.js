@@ -420,7 +420,13 @@
     const cs = s.candles?.[tf] || [];
     const lastBar = cs[cs.length - 1];
     const rem = lastBar ? Math.max(0, Math.ceil((lastBar.t + ms - s.now) / 1000)) : 0;
-    el.clk.textContent = rem > 0 ? rem + 's' : 'close';
+    // A delayed proxy's newest bar closed minutes ago; counting down to its
+    // close would put a fake expiry clock on the floating widget. Kept to one
+    // short word because this row is 42px wide next to the confluence bar, and
+    // the full explanation lives in the dashboard.
+    const delayed = !!s.sync?.delayed;
+    el.clk.textContent = delayed ? 'delay' : rem > 0 ? rem + 's' : 'close';
+    el.clk.title = delayed ? 'Delayed proxy feed — no live expiry clock to show' : '';
 
     // Say where the candles on screen came from. "site m5" means these are the
     // broker's own candles for the chart the user has open — the only way the
@@ -428,7 +434,8 @@
     // just drew, which is why this line is here and not next to the price.
     const fromSite = s.sync?.barsFrom === 'broker';
     el.meta.textContent =
-      'pay ' + (payout ? payout + '%' : '?') + ' · ' + cs.length + (fromSite ? ` bars · site ${tf}` : ' bars');
+      'pay ' + (payout ? payout + '%' : '?') + ' · ' + cs.length + (fromSite ? ` bars · site ${tf}` : ' bars') +
+      (delayed ? ' · delayed' : '');
 
     const open = (s.openTrades || [])[0];
     el.ticket.textContent = open

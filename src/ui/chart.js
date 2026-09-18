@@ -283,7 +283,19 @@ function fmt(v) {
   return v.toFixed(a >= 1000 ? 2 : a >= 100 ? 3 : a >= 10 ? 4 : 5);
 }
 
+/**
+ * Axis labels are UTC, deliberately, and say so.
+ *
+ * The broker's own chart is drawn in UTC and the site prints "UTC" beside its
+ * clock. Formatting this chart's axis in the machine's local time put two
+ * different numbers under the same candle — on a UTC+6 machine the site showed
+ * 06:48 while this chart showed 12:48 for that exact bar — so the user could
+ * not line the two charts up to see the delay they were being warned about.
+ */
 function clock(t) {
   const d = new Date(t);
-  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  return `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
 }
+
+/** Suffix for the axis caption, so UTC is never left implicit. */
+export const AXIS_TZ_LABEL = 'UTC';

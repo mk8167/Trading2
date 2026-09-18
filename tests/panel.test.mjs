@@ -358,3 +358,182 @@ test('the picker still works when the catalog arrives in the old shape', () => {
   // predates the object shape must not blank the picker or throw.
   assert.doesNotThrow(() => render(payload(), 'chart'));
 });
+
+/* ------------- the page that produced the bug report --------------------- */
+
+/*
+ * What the panel actually said next to a live broker chart: "yahoo feed",
+ * "candle sync ✗", "0s to close", and a green "✓ LIVE — ticks every frame on
+ * 33 instrument(s)" banner, on a page where not one broker frame had ever
+ * arrived. Every one of those lines was true of the REST proxies and false
+ * about what the user was looking at, which is worse than saying nothing.
+ */
+
+/** Candles whose newest bar is still forming at the fixture's `now`, so the
+ *  countdown has something real to count down to. */
+const NOW = T0 + 60 * 60_000;
+const liveBars = (n = 60) =>
+  Array.from({ length: n }, (_, i) => ({
+    t: NOW - 20_000 - (n - 1 - i) * 60_000,
+    o: 1.1 + i * 1e-5, h: 1.1004 + i * 1e-5, l: 1.0996 + i * 1e-5, c: 1.1002 + i * 1e-5,
+  }));
+
+test('the feed banner cannot call a proxy-only page LIVE', () => {
+  render(payload({
+    symbols: [{ sym: 'GBPUSD', pretty: 'GBP/USD', assetClass: 'forex', otc: false, source: 'yahoo', price: 1.3, ts: T0, payout: 65, ticks: 0, bars: 120, stale: false, selected: true }],
+    diag: { frames: 0, ticks: 0, brokerTicks: 0, sockets: 0, brokerRows: 0, restPolls: 383, pairs: 1, lastFrameAge: null, uptime: 60_000, errors: [], samples: [], methods: {} },
+  }), 'feed');
+  const line = get('fdiag-line').innerHTML;
+
+  assert.doesNotMatch(line, /✓ LIVE/, 'a delayed proxy is not a live feed');
+  assert.match(line, /NOT LIVE/, 'the page has to say so plainly');
+  assert.match(line, /REST proxy, not the broker/, 'and say what it is instead');
+  assert.match(line, /Grant &amp; install/, 'and name the one fix that applies: the hook is not on this domain');
+  assert.match(get('fdiag').innerHTML, /Broker ticks/, 'the Feed tab shows the broker-only counter');
+});
+
+test('broker ticks alone switch the banner back to LIVE', () => {
+  render(payload({
+    symbols: [
+      { sym: 'AAPL', pretty: 'Apple', assetClass: 'stock', otc: false, source: 'quotex', price: 200, ts: T0, payout: 68, ticks: 900, bars: 60, stale: false, selected: true },
+      { sym: 'BTCUSD', pretty: 'BTC/USD', assetClass: 'crypto', otc: false, source: 'binance', price: 60000, ts: T0, payout: 80, ticks: 12, bars: 120, stale: false },
+    ],
+    diag: { frames: 40, ticks: 912, brokerTicks: 900, sockets: 2, brokerRows: 60, pairs: 2, restPolls: 3, lastFrameAge: 900, uptime: 60_000, errors: [], samples: [], methods: {} },
+  }), 'feed');
+  const line = get('fdiag-line').innerHTML;
+
+  assert.match(line, /✓ LIVE — broker ticks on 1 instrument/);
+  assert.match(line, /1 more on REST proxies/, 'both populations are reported, not just the flattering one');
+});
+
+test('a delayed proxy does not get a countdown clock', () => {
+  const cs = liveBars(60);
+  render(payload({
+    sync: {
+      source: 'yahoo', aligned: false, tickAgeSec: 900, barsFrom: 'ticks', bars: 60,
+      delayed: true, dataAgeSec: 900, signalTf: 'm1', followSite: true, formingOpen: cs.at(-1).t, expectedOpen: cs.at(-1).t + 60_000,
+    },
+    candles: { m1: cs, m5: bars(12), m15: bars(4) },
+    secondsToClose: 21,
+  }), 'chart');
+
+  const readout = get('readout').textContent;
+  assert.match(readout, /axis UTC/, 'the axis timezone is stated, because the site draws UTC');
+
+  const sync = get('preview').innerHTML;
+  assert.match(sync, /delayed yahoo copy/);
+  assert.match(sync, /~15m behind the site/, 'the actual delay is named');
+  assert.match(sync, /countdown above run on the proxy.s clock/, 'and the countdown is disowned');
+  assert.doesNotMatch(sync, /seconds to close/);
+
+  assert.match(get('clock').textContent, /delayed proxy clock/, 'the header clock stops counting down to a close that already happened');
+});
+
+test('a live broker series keeps its ordinary sync line and countdown', () => {
+  const cs = liveBars(60);
+  render(payload({
+    sync: {
+      source: 'quotex', aligned: true, tickAgeSec: 2, barsFrom: 'broker', bars: 60,
+      delayed: false, dataAgeSec: 0, signalTf: 'm1', followSite: true,
+    },
+    candles: { m1: cs, m5: bars(12), m15: bars(4) },
+    secondsToClose: 21,
+  }), 'chart');
+
+  const sync = get('preview').innerHTML;
+  assert.match(sync, /candle sync ✓/);
+  assert.doesNotMatch(sync, /delayed/);
+  assert.match(get('clock').textContent, /s to close/);
+});
+
+/* --------------- installing the hook on a domain we cannot see ----------- */
+
+/*
+ * The screenshot case again, from the other end: the fix for a page whose hook
+ * was never injected is Settings → "Grant & install". Chrome will not report a
+ * tab's address to an extension that has no access to it, so the first click
+ * comes back empty — and the old copy answered that with "Enter a full origin,
+ * e.g. https://example.com", which describes neither the problem nor the fix.
+ * After the grant the page also has to be reloaded, because the bridge runs at
+ * document_start and the page in front of the user is already loaded.
+ */
+
+test('granting a domain Chrome will not name says why, then finishes the job', async () => {
+  const reloaded = [];
+  chrome.permissions = { request: async () => true };
+  chrome.tabs = {
+    query: async (q) => (q.url ? [{ id: 7 }, { id: 9 }] : [{ id: 7 }, { id: 9, url: undefined }]),
+    reload: async (id) => reloaded.push(id),
+  };
+
+  get('sOrigin').value = '';
+  get('sGrant').emit('click');
+  await new Promise((r) => setTimeout(r, 5));
+  const first = get('grantOut').textContent;
+  assert.match(first, /withholds this page's address|Type the site address/);
+  assert.doesNotMatch(first, /^Enter a full origin, e\.g\./, 'a dead end is not an explanation');
+
+  nextResponse = { ok: true, pattern: 'https://broker.example/*' };
+  get('sOrigin').value = 'https://broker.example';
+  get('sGrant').emit('click');
+  await new Promise((r) => setTimeout(r, 5));
+
+  assert.deepEqual(reloaded, [7, 9], 'every open tab on that domain is reloaded so the hook actually runs');
+  assert.match(get('grantOut').textContent, /reloaded 2 tabs/);
+  nextResponse = { ok: false };
+});
+
+
+test('a dead feed tells the two possible causes apart', async () => {
+  const dead = {
+    symbols: [],
+    diag: { frames: 0, ticks: 0, brokerTicks: 0, sockets: 0, brokerRows: 0, pairs: 0, restPolls: 383, lastFrameAge: null, uptime: 60_000, errors: [], samples: [], methods: {} },
+  };
+  // The verdict uses the address cached by the previous render and refreshes
+  // it in the background, so it takes a couple of cycles to settle — which is
+  // fine in the panel, where a push arrives every second.
+  const settle = () => new Promise((r) => setTimeout(r, 5));
+  const renderFeed = async () => {
+    for (let i = 0; i < 3; i++) {
+      render(payload(dead), 'feed');
+      await settle();
+    }
+  };
+
+  // Case A — Chrome will not name the page: the extension has no access there.
+  chrome.tabs = { query: async () => [{ id: 3 }], reload: async () => {} };
+  await renderFeed();
+  const noAccess = get('fdiag-line').innerHTML;
+  assert.match(noAccess, /will not even show this extension the page address/);
+  assert.match(noAccess, /grant it in Options → Site access/);
+
+  // Case B — Chrome names the page, so the hook IS installed there; granting it
+  // again would be advice that cannot change anything.
+  chrome.tabs = { query: async () => [{ id: 3, url: 'https://broker.example/trade' }], reload: async () => {} };
+  await renderFeed();
+  const hasAccess = get('fdiag-line').innerHTML;
+  assert.match(hasAccess, /DOES have access to https:\/\/broker\.example/);
+  assert.match(hasAccess, /Web Worker|reload it/);
+  assert.doesNotMatch(hasAccess, /grant it in Options/, 'it is already granted — that is not the problem here');
+});
+
+test('a live proxy is not called "delayed" — only a slow one is', () => {
+  // Binance's crypto feed is current; Yahoo's is a quarter of an hour behind.
+  // Both are "not the broker's feed", but only one of them is late, and the
+  // countdown warning has to match which.
+  const cs = liveBars(60);
+  render(payload({
+    sync: {
+      source: 'binance', aligned: true, tickAgeSec: 4, barsFrom: 'ticks', bars: 60,
+      delayed: true, dataAgeSec: 20, signalTf: 'm1', followSite: true,
+    },
+    candles: { m1: cs, m5: liveBars(12), m15: liveBars(4) },
+    secondsToClose: 41,
+  }), 'chart');
+
+  const sync = get('preview').innerHTML;
+  assert.match(sync, /binance proxy — this is not the broker's own feed/);
+  assert.doesNotMatch(sync, /~\d+m behind/, 'a 20-second-old bar is not "behind"');
+  assert.doesNotMatch(sync, /delayed/);
+  assert.match(get('clock').textContent, /delayed proxy clock/, 'the countdown is still not the site clock');
+});

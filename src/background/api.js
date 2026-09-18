@@ -321,6 +321,10 @@ async function stateGet(msg) {
     diag: {
       frames: store.diag.frames,
       ticks: store.diag.ticks,
+      // Prices that came out of the broker's own socket. The Feed tab shows
+      // this next to the total so "we are receiving prices" can never be
+      // mistaken for "we are receiving the broker's prices".
+      brokerTicks: store.diag.brokerTicks || 0,
       historyRows: store.diag.historyRows,
       // History blocks and the candles the BROKER itself sent for its chart.
       // A pair with ticks but no broker bars is a pair whose page was never
@@ -382,6 +386,23 @@ function buildSync(st, tf, now, settings) {
      */
     signalTf: 'm1',
     followSite: settings ? settings.syncSite !== false : true,
+    /**
+     * True when the series on screen is a REST proxy rather than the broker's
+     * own stream.
+     *
+     * Two different things are true of such a series and both matter for a
+     * 1-minute expiry: it is not the price the site is showing, and — for
+     * Yahoo in particular, whose 1-minute bars arrive a quarter of an hour
+     * late — the bar clock the countdown counts to is not the site's clock.
+     * Printing "45s to close" and "bar NOT on the timeframe boundary" off
+     * that clock is a confident statement about a bar that closed long ago.
+     * The UI uses this flag plus `dataAgeSec` to say which of the two it is.
+     */
+    delayed: st.source !== 'quotex',
+    /** How far the newest bar's close sits behind "now", i.e. behind the site's clock. */
+    dataAgeSec: series.length
+      ? Math.max(0, Math.round((now - (series[series.length - 1].t + tfMs)) / 1000))
+      : null,
   };
 }
 
