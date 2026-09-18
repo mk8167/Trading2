@@ -16,10 +16,10 @@ import * as engine from './engine.js';
 import { handleMessage } from './api.js';
 import * as binance from './feeds/binance.js';
 import * as yahoo from './feeds/yahoo.js';
+import { canonical } from './symbols.js';
 
 const HEARTBEAT_MS = 1000;
 const SNAPSHOT_KEY = 'market.snapshot.v6';
-
 let heartbeat = null;
 let last = { snapshot: 0, binance: 0, yahoo: 0, housekeep: 0, boot: 0 };
 let booted = false;
@@ -51,12 +51,26 @@ async function boot() {
   startHeartbeat();
 }
 
+/**
+ * Backfill 1m history for crypto the broker told us about but sent no candles
+ * for. We deliberately do not seed the whole fallback list at boot: that is
+ * 30+ sequential 500-bar requests every time the worker wakes, and it would
+ * manufacture symbols for pairs the user never opened. A pair the broker owns
+ * is never seeded either — see store.ensureSymbol's source authority.
+ */
 async function seedRest() {
+  const targets = [];
   for (const pair of Object.keys(binance.CRYPTO)) {
     const st = store.getSymbol(pair);
-    if (!st || !st.tf.m1.length) {
-      await binance.seed(pair).catch((e) => store.noteError(`seed ${pair}: ${e?.message || e}`));
-    }
+    if (st && !st.tf.m1.length && st.source !== 'quotex') targets.push(pair);
+  }
+  const sel = store.selected;
+  if (sel) {
+    const pair = Object.keys(binance.CRYPTO).find((p) => canonical(p) === sel);
+    if (pair && !targets.includes(pair)) targets.unshift(pair);
+  }
+  for (const pair of targets) {
+    await binance.seed(pair).catch((e) => store.noteError(`seed ${pair}: ${e?.message || e}`));
   }
 }
 
@@ -111,7 +125,7 @@ async function tick() {
 
   if (s.feeds?.binance && now - last.binance >= (s.feeds.binanceMs || 30_000)) {
     last.binance = now;
-    for (const pair of Object.keys(binance.CRYPTO)) binance.poll(pair);
+    for (const pair of binance.pairsToPoll()) binance.poll(pair);
   }
 
   if (s.feeds?.yahoo && now - last.yahoo >= (s.feeds.yahooMs || 60_000)) {

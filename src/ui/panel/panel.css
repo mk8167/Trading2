@@ -163,6 +163,17 @@ code { background: var(--bg3); padding: 1px 4px; border-radius: 4px; font-size: 
 .row-btns { display: flex; gap: 7px; margin-top: 10px; flex-wrap: wrap; }
 
 .muted { color: var(--mut); font-size: 11px; }
+
+/* Honesty banners. Deliberately plain and always-visible: these say things the
+   user would rather not read, so hiding them behind a tooltip is the same as
+   not saying them. */
+.banner { border-radius: 9px; padding: 8px 10px; font-size: 10.5px; line-height: 1.45; margin-bottom: 8px; border: 1px solid var(--line); background: var(--bg2); color: var(--mut); }
+.banner b { color: var(--fg); }
+.banner.stop { border-color: #e04b5b; background: rgba(224, 75, 91, .12); color: #f0a3ab; }
+.banner.stop b { color: #ff8b98; }
+.banner.warn { border-color: #f5c33b; background: rgba(245, 195, 59, .10); color: #d9c08a; }
+.banner.warn b { color: #f5c33b; }
+.bk { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 6px; margin-top: 7px; }
 .disc {
   margin-top: 18px; padding: 9px 10px; border-radius: 9px; font-size: 10.5px; color: #a8b7c8;
   background: rgba(245,195,59,.06); border: 1px solid rgba(245,195,59,.2);

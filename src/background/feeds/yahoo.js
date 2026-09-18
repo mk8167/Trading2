@@ -8,8 +8,9 @@
  * ----------------------------------------------------------------*/
 
 import * as store from '../store.js';
-import { upsertCandle, aggregate, DEFAULT_CAP, TF_MS } from '../candles.js';
+import { upsertCandle, DEFAULT_CAP } from '../candles.js';
 
+/** Pair -> Yahoo symbol. Delayed, rotated one at a time, always labelled. */
 export const FX = {
   'EUR/USD': 'EURUSD=X',
   'GBP/USD': 'GBPUSD=X',
@@ -23,6 +24,31 @@ export const FX = {
   'EUR/GBP': 'EURGBP=X',
   'AUD/JPY': 'AUDJPY=X',
   'CAD/JPY': 'CADJPY=X',
+  'EUR/CHF': 'EURCHF=X',
+  'GBP/CHF': 'GBPCHF=X',
+  'EUR/AUD': 'EURAUD=X',
+  'EUR/CAD': 'EURCAD=X',
+  'GBP/AUD': 'GBPAUD=X',
+  'GBP/CAD': 'GBPCAD=X',
+  'AUD/CAD': 'AUDCAD=X',
+  'AUD/NZD': 'AUDNZD=X',
+  'AUD/CHF': 'AUDCHF=X',
+  'CAD/CHF': 'CADCHF=X',
+  'CHF/JPY': 'CHFJPY=X',
+  'NZD/JPY': 'NZDJPY=X',
+  'NZD/CAD': 'NZDCAD=X',
+  'EUR/NZD': 'EURNZD=X',
+  'USD/SGD': 'USDSGD=X',
+  'USD/HKD': 'USDHKD=X',
+  'USD/SEK': 'USDSEK=X',
+  'USD/NOK': 'USDNOK=X',
+  'USD/DKK': 'USDDKK=X',
+  'USD/PLN': 'USDPLN=X',
+  'USD/TRY': 'USDTRY=X',
+  'USD/ZAR': 'USDZAR=X',
+  'USD/MXN': 'USDMXN=X',
+  'XAU/USD': 'GC=F',
+  'XAG/USD': 'SI=F',
 };
 
 const HOSTS = ['https://query1.finance.yahoo.com', 'https://query2.finance.yahoo.com'];
@@ -65,9 +91,9 @@ export async function poll(pair, { signal } = {}) {
         continue;
       }
       const s = store.ensureSymbol(pair, 'yahoo');
+      if (!s) return true; // the broker owns this pair now; not an error
       for (const c of rows) upsertCandle(s.tf.m1, c, DEFAULT_CAP.m1);
-      s.tf.m5 = aggregate(s.tf.m1, TF_MS.m5, DEFAULT_CAP.m5);
-      s.tf.m15 = aggregate(s.tf.m1, TF_MS.m15, DEFAULT_CAP.m15);
+      store.refreshDerived(pair);
       const last = rows[rows.length - 1];
       s.price = last.c;
       s.ts = last.t;

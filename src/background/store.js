@@ -62,6 +62,8 @@ export const diag = {
   bridges: new Set(),
   evictions: 0,
   pruned: 0,
+  sourceTakeovers: 0,
+  proxyRefusals: 0,
   payoutsQueued: 0,
   payoutsApplied: 0,
 };
@@ -96,9 +98,27 @@ export function getSymbol(sym) {
   return symbols.get(canonical(sym)) || null;
 }
 
-export function ensureSymbol(sym, source = 'quotex', hint = null) {
+/**
+ * Source authority.
+ *
+ * The broker's own socket is the truth about the broker's price. A REST
+ * proxy is delayed, and for crypto it is not even the same underlying —
+ * Binance quotes BTCUSDT while the broker quotes BTC/USD, and those two
+ * numbers differ. Now that one canonical key covers every spelling, a proxy
+ * would otherwise append its rows straight into the live series, quietly
+ * poisoning every indicator computed from it.
+ *
+ * So: a proxy may never write to a key the broker owns, and when the broker
+ * starts streaming a key a proxy was standing in for, the proxy's candles are
+ * discarded rather than blended. Losing a warm-up costs minutes; a blended
+ * series costs correctness.
+ */
+const LIVE_SOURCE = 'quotex';
+
+export function ensureSymbol(sym, source = LIVE_SOURCE, hint = null, opts = null) {
   const key = canonical(sym);
   if (!key) return null;
+  const force = !!(opts && opts.force);
   let s = symbols.get(key);
   if (!s) {
     if (symbols.size >= MAX_SYMBOLS) evictOldest();
@@ -130,10 +150,28 @@ export function ensureSymbol(sym, source = 'quotex', hint = null) {
       if (pending.payout != null) applyPayout(s, pending.payout, pending.payoutAt || Date.now());
       if (pending.type || pending.otc != null) applyMeta(s, { type: pending.type, otc: pending.otc });
     }
-  } else if (hint) {
-    applyMeta(s, hint);
+  } else if (s.source !== source && !force) {
+    if (source === LIVE_SOURCE) {
+      // Broker taking over from a proxy: drop the proxy's candles.
+      if (s.tf.m1.length) {
+        s.tf.m1 = makeSeries(TF_MS.m1);
+        s.tf.m5 = makeSeries(TF_MS.m5);
+        s.tf.m15 = makeSeries(TF_MS.m15);
+        s.price = NaN;
+        s.ts = 0;
+        s.tickCount = 0;
+        diag.sourceTakeovers = (diag.sourceTakeovers || 0) + 1;
+      }
+      s.source = LIVE_SOURCE;
+    } else if (s.source === LIVE_SOURCE) {
+      diag.proxyRefusals = (diag.proxyRefusals || 0) + 1;
+      return null; // a proxy may not write into a live broker series
+    } else {
+      diag.proxyRefusals = (diag.proxyRefusals || 0) + 1;
+      return null; // first proxy to claim a key keeps it
+    }
   }
-  if (source && s.source !== source && source === 'quotex') s.source = source;
+  if (hint) applyMeta(s, hint);
   return s;
 }
 
@@ -365,10 +403,10 @@ export function deserialize(snap) {
   for (const [sym, data] of Object.entries(snap.symbols)) {
     const key = canonical(sym);
     if (!key) continue;
-    const s = ensureSymbol(key, data.source || 'quotex', {
+    const s = ensureSymbol(key, data.source || LIVE_SOURCE, {
       type: data.declaredType || undefined,
       otc: typeof data.otc === 'boolean' ? data.otc : undefined,
-    });
+    }, { force: true }); // restoring our own snapshot is not a foreign write
     if (!s) continue;
     // Snapshots written by an older build can hold the same instrument under
     // two spellings ("EURUSD_OTC" and "EUR/USD_OTC"). Both canonicalise to

@@ -274,6 +274,10 @@ async function stateGet(msg) {
     secondsToClose: ev.secondsToClose ?? null,
     sync: buildSync(st, ev.tf, msg.now || Date.now()),
     openTrades: ev.open,
+    // Starting balance plus realized P&L, and whether it can still cover a
+    // stake. The panel shows this so a losing run is visible before it is
+    // catastrophic rather than after.
+    bankroll: engine.bankroll(s),
     journal: journalPayload(s),
     symbols: store.listSymbols(),
     catalog: buildCatalog(),
@@ -286,6 +290,10 @@ async function stateGet(msg) {
       unparsed: store.diag.unparsed,
       sockets: store.diag.sockets,
       restPolls: store.diag.restPolls,
+      // Data provenance: how often a delayed proxy was refused entry to a
+      // broker-owned series, and how often the broker took a series back.
+      proxyRefusals: store.diag.proxyRefusals || 0,
+      sourceTakeovers: store.diag.sourceTakeovers || 0,
       bridges: store.diag.bridges.size,
       pairs: store.symbols.size,
       lastFrameAge: store.diag.lastFrameAt ? Date.now() - store.diag.lastFrameAt : null,

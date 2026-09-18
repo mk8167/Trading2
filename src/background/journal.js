@@ -53,10 +53,6 @@ export function settleTrade(trade, price, at = Date.now()) {
   return trade;
 }
 
-export function openExposure(trades) {
-  return trades.filter((t) => !t.result);
-}
-
 /* ------------------------------ stats -------------------------------- */
 
 /**
@@ -159,9 +155,6 @@ export const byDirection = (trades) => groupStats(trades, (t) => t.dir);
 /** Per asset class — the edge on a synthesised OTC feed is not the edge on
  *  a real crypto market, and averaging them hides which is which. */
 export const byClass = (trades) => groupStats(trades, (t) => t.assetClass || 'unknown');
-export const byHour = (trades) =>
-  groupStats(trades, (t) => `${String(new Date(t.openedAt).getHours()).padStart(2, '0')}:00`);
-
 /** Equity curve as [{t, equity}] starting from `start`. */
 export function equityCurve(trades, start = 0) {
   let eq = start;

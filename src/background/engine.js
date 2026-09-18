@@ -55,7 +55,13 @@ export function evaluate(sym, settings) {
   // Settle everything that expired, on this symbol AND every other one.
   // Settling only `sym` stranded trades whenever the user switched pairs,
   // and a stranded trade blocks that pair from ever trading again.
-  const settled = ledger.settleAllDue(lastPrice, now);
+  // seriesOf gives the ledger the candle history so a settlement made after a
+  // service-worker restart can use the price AT expiry rather than the price
+  // whenever the worker happened to wake up. See ledger.priceAtExpiry.
+  const settled = ledger.settleAllDue(lastPrice, now, (sym) => {
+    const x = store.getSymbol(sym);
+    return x ? { m1: x.tf.m1, ts: x.ts } : null;
+  });
 
   const assetClass = s.assetClass || 'unknown';
   const data = {
@@ -117,6 +123,34 @@ export function evaluate(sym, settings) {
   };
 }
 
+/**
+ * Bankroll protection.
+ *
+ * `settings.balance` is a number the user typed once. Every trade since then
+ * has moved the real bankroll without moving that number, so a fixed
+ * percentage of a stale balance keeps staking after the money is gone: start
+ * at $100 risking 5%, lose twenty in a row, and the engine is still risking $5
+ * of an account that no longer exists. So the figure we risk against is the
+ * starting balance plus realized P&L — voids contribute nothing, which is
+ * right, since a voided trade returned its stake.
+ *
+ * @returns {{starting:number, realized:number, current:number, riskPct:number, stake:number, canTrade:boolean, reason:string|null}}
+ */
+export function bankroll(settings, trades = ledger.trades) {
+  const starting = Number.isFinite(settings?.balance) && settings.balance > 0 ? settings.balance : 0;
+  const riskPct = Number.isFinite(settings?.riskPct) && settings.riskPct > 0 ? settings.riskPct : 1;
+  let realized = 0;
+  // A corrupt or partially-written journal row must not be able to throw here:
+  // this runs inside maybeTrade, so a crash would silently stop all trading.
+  for (const t of trades || []) if (t && t.result && Number.isFinite(t.pnl)) realized += t.pnl;
+  const current = starting + realized;
+  const stake = Math.max(0.01, +((current * riskPct) / 100).toFixed(2));
+  let reason = null;
+  if (!(current > 0)) reason = `bankroll is ${current.toFixed(2)} — the starting balance plus realized P&L is gone`;
+  else if (!(stake <= current)) reason = `bankroll ${current.toFixed(2)} cannot cover even the minimum ${stake.toFixed(2)} stake`;
+  return { starting, realized, current, riskPct, stake, canTrade: !reason, reason };
+}
+
 function maybeTrade(sym, sig, { settings, price, payout, source, assetClass, otc }) {
   if (!settings.autoPaperTrade) return;
   if (ledger.openOn(sym).length) return;
@@ -134,7 +168,15 @@ function maybeTrade(sym, sig, { settings, price, payout, source, assetClass, otc
     return;
   }
 
-  const stake = Math.max(0.01, +(((settings.balance || 100) * (settings.riskPct || 1)) / 100).toFixed(2));
+  // Refuse to trade once losses have eaten the bankroll. This is a stop, not a
+  // suggestion: sizing off the stale starting balance is how a paper account
+  // quietly goes negative and keeps reporting a strategy as viable.
+  const bk = bankroll(settings);
+  if (!bk.canTrade) {
+    ledger.logEvent('gate', `${sym} — STOPPED: ${bk.reason}`);
+    return;
+  }
+  const stake = bk.stake;
   ledger.openTrade({
     sym,
     dir: sig.dir,

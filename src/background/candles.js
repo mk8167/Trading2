@@ -8,7 +8,6 @@
  * ----------------------------------------------------------------*/
 
 export const TF_MS = { m1: 60_000, m5: 300_000, m15: 900_000, m30: 1_800_000 };
-export const TFS = Object.keys(TF_MS);
 export const DEFAULT_CAP = { m1: 600, m5: 400, m15: 300, m30: 240 };
 
 export const bucketOf = (ts, tfMs) => Math.floor(ts / tfMs) * tfMs;
@@ -17,10 +16,6 @@ export const isCandle = (c) =>
   !!c &&
   typeof c === 'object' &&
   [c.t, c.o, c.h, c.l, c.c].every((v) => typeof v === 'number' && Number.isFinite(v));
-
-export function makeCandle(t, o, h, l, c) {
-  return { t, o, h, l, c };
-}
 
 export function lastOf(arr) {
   return arr && arr.length ? arr[arr.length - 1] : null;
