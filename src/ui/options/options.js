@@ -114,6 +114,14 @@ function download(text, name, type) {
 
 const stamp = () => new Date().toISOString().slice(0, 10);
 
+/* The page used to hardcode a version string and had been two releases behind.
+ * The manifest is the one place a version is defined. */
+try {
+  $('ver').textContent = 'v' + chrome.runtime.getManifest().version;
+} catch {
+  /* no manifest in a test stub — the page simply shows no version */
+}
+
 currentOrigin().then((o) => {
   if (o) $('origin').placeholder = o;
 });

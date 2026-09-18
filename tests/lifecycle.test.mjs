@@ -364,3 +364,31 @@ test('an old journal with mixed spellings is folded together on load', async () 
   const s = stats(ledger.trades, { payout: 86 });
   assert.equal(s.decided, 2);
 });
+
+test('a late tick cannot drag the live quote or the clock backwards', () => {
+  clearStore();
+  const sym = 'EURUSD_OTC';
+  tick(sym, 1.10, T0);
+  tick(sym, 1.11, T0 + 60_000);
+  tick(sym, 1.12, T0 + 120_000);
+
+  // Within the tolerance the store accepts (60s back), but older than the bar
+  // we are on: the candle builder must not append it behind the newest bar and
+  // the live price must stay at the newest observation.
+  const s = tick(sym, 1.05, T0 + 60_000 + 5_000);
+  assert.ok(s, 'a merely-late tick is still accepted');
+  assert.equal(s.price, 1.12, 'the live quote did not go backwards');
+  assert.equal(s.ts, T0 + 120_000, 's.ts is the feed clock for the live price');
+  assert.equal(s.tickCount, 4, 'the tick was counted');
+  assert.equal(s.tf.m1.length, 3, 'no phantom bar was appended');
+  assert.equal(store.isStale(s, T0 + 120_000 + 10_000), false, 'freshness is judged from the newest tick');
+});
+
+test('a tick that rewinds the clock by more than a minute is rejected outright', () => {
+  clearStore();
+  const sym = 'EURUSD_OTC';
+  tick(sym, 1.10, T0 + 300_000);
+  assert.equal(tick(sym, 9.99, T0), null, 'two minutes back is not a late tick, it is stale data');
+  assert.equal(store.getSymbol(sym).price, 1.10);
+  assert.equal(store.getSymbol(sym).tf.m1.length, 1);
+});

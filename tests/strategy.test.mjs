@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { analyze, breakEvenWinRate, gate, lossStreak, winStreak, DEFAULT_OPTS } from '../src/background/strategy.js';
+import { analyze, breakEvenWinRate, gate, lossStreak, winStreak, isDecided, DEFAULT_OPTS } from '../src/background/strategy.js';
 import { series, flatSeries } from './helpers.mjs';
 import { aggregate } from '../src/background/candles.js';
 
@@ -146,6 +146,55 @@ test('streak counters', () => {
   assert.equal(lossStreak([t('loss'), t('win')]), 0);
   assert.equal(winStreak([t('loss'), t('win'), t('win')]), 2);
   assert.equal(lossStreak([]), 0);
+});
+
+test('the risk gate ignores trades that have not decided anything', () => {
+  const now = 1_700_000_000_000;
+  const trade = (result, i) => ({ dir: 'up', openedAt: now - (40 - i) * 300_000, result, payout: 86, stake: 1, pnl: 0 });
+  // 9 wins and 3 losses = 75%, comfortably above the 53.8% break-even.
+  const decided = [
+    ...Array.from({ length: 9 }, (_, i) => trade('win', i)),
+    ...Array.from({ length: 3 }, (_, i) => trade('loss', 9 + i)),
+  ];
+  const open = Array.from({ length: 8 }, (_, i) => trade(null, 12 + i)); // 1-minute expiries still in flight
+  const voids = Array.from({ length: 6 }, (_, i) => trade('void', 20 + i)); // feed gaps, no settlement price
+
+  const opts = { gateLookback: 20, gateMargin: 0.03, cooldownMs: 0 };
+  const sig = { dir: 'up', score: 6, vetoes: [] };
+  assert.equal(gate({ signal: sig, trades: decided, payout: 86, now, opts }).ok, true, 'baseline: 75% win rate passes');
+  // Open trades used to sit in the denominator: 9/20 read as 45% and the gate
+  // stopped trading a strategy that was above break-even.
+  assert.equal(gate({ signal: sig, trades: [...decided, ...open], payout: 86, now, opts }).ok, true, 'open trades must not dilute the win rate');
+  assert.equal(gate({ signal: sig, trades: [...decided, ...voids], payout: 86, now, opts }).ok, true, 'voided trades carry no evidence');
+  const ties = Array.from({ length: 6 }, (_, i) => trade('tie', 26 + i));
+  assert.equal(gate({ signal: sig, trades: [...decided, ...ties], payout: 86, now, opts }).ok, true, 'a push is not a loss');
+
+  // ...and the gate still stops a run that IS under break-even.
+  const bad = Array.from({ length: 20 }, (_, i) => trade(i % 3 === 0 ? 'win' : 'loss', i)); // 6/20 = 30%
+  assert.equal(gate({ signal: sig, trades: bad, payout: 86, now, opts }).ok, false);
+});
+
+test('undecided trades do not break a losing streak', () => {
+  const t = (result) => ({ dir: 'up', result, openedAt: 0 });
+  assert.equal(lossStreak([t('loss'), t('void'), t('loss'), t('loss')]), 3, 'a void must not reset the run');
+  assert.equal(lossStreak([t('loss'), t('tie'), t('loss')]), 2);
+  assert.equal(lossStreak([t('loss'), t('win')]), 0);
+  assert.equal(winStreak([t('win'), t('void'), t('win')]), 2);
+  // An open trade at the tail is skipped, not treated as a rescue.
+  assert.equal(lossStreak([t('loss'), t('loss'), t(null)]), 2);
+});
+
+test('strategy.isDecided and journal.isDecided are the same rule', async () => {
+  // The gate lives in strategy.js and the statistics live in journal.js; they
+  // must never disagree about what counts, so the duplication is asserted.
+  const { isDecided: inJournal } = await import('../src/background/journal.js');
+  const cases = [
+    { result: 'win' }, { result: 'loss' }, { result: 'tie' },
+    { result: 'void' }, { result: null }, {}, null, undefined,
+  ];
+  for (const t of cases) {
+    assert.equal(isDecided(t), inJournal(t), `disagreement on ${JSON.stringify(t)}`);
+  }
 });
 
 /* ------------------ asset-class awareness (v6.1) --------------------- */

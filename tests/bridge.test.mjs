@@ -191,3 +191,17 @@ test('a broken payload never throws into the page', () => {
   assert.doesNotThrow(() => ws.dispatch('message', { data: {} }));
   assert.equal(posted.filter((m) => m.kind === 'frame').length, 0);
 });
+
+test('an oversized binary frame is dropped instead of base64-encoded', () => {
+  const { win, posted } = makePage();
+  const ws = new win.WebSocket('wss://x/');
+  // 1 MB of binary: base64 would make it 1.33 MB, copied through postMessage
+  // and then through an extension message. The parser refuses anything over
+  // 256 KB, so relaying it is pure waste.
+  ws.dispatch('message', { data: new Uint8Array(1024 * 1024).buffer });
+  assert.equal(posted.filter((m) => m.kind === 'frame').length, 0, 'not relayed');
+
+  // A frame at the limit still gets through.
+  ws.dispatch('message', { data: new Uint8Array(64 * 1024).buffer });
+  assert.equal(posted.filter((m) => m.kind === 'frame').length, 1, 'reasonably sized frames are untouched');
+});

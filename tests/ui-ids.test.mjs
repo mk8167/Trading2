@@ -142,3 +142,25 @@ test('manifest version matches package.json version', () => {
   assert.equal(JSON.parse(read('manifest.json')).version, JSON.parse(read('package.json')).version,
     'a version mismatch means the store listing and the loaded extension disagree');
 });
+
+/* --------------------------- version drift ---------------------------- */
+
+test('no page hardcodes a version number', () => {
+  // The panel and the options page both shipped "v6.0.0" while the manifest
+  // said 6.2.0, and nothing could notice: a version string is just text.
+  for (const page of PAGES) {
+    const html = read(page.html);
+    assert.doesNotMatch(html, /\bv\d+\.\d+\.\d+\b/, `${page.name} must not hardcode a version`);
+  }
+});
+
+test('every page that shows a version reads it from the manifest', () => {
+  const shows = { panel: 'src/ui/panel/panel.js', options: 'src/ui/options/options.js' };
+  for (const [name, js] of Object.entries(shows)) {
+    const html = read(PAGES.find((p) => p.name === name).html);
+    const code = read(js);
+    assert.match(html, /id="ver"/, `${name} needs an element to put the version in`);
+    assert.match(code, /getManifest\(\)\.version/, `${name} must read the manifest version`);
+  }
+  assert.doesNotMatch(read('src/ui/popup/popup.js'), /\bv\d+\.\d+\.\d+\b/);
+});

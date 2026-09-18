@@ -3,7 +3,12 @@
  * implemented; anything else throws so an unnoticed API use shows up
  * loudly instead of silently doing nothing. */
 
+import fs from 'node:fs';
+
 const mem = { local: new Map(), session: new Map(), sync: new Map() };
+/* Read the real version rather than a copy, so the stub cannot drift from the
+ * manifest the way two hardcoded strings drift from each other. */
+const pkg = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 
 const area = (map) => ({
   async get(keys) {
@@ -52,6 +57,7 @@ export function install() {
         return Promise.resolve({ ok: true });
       },
       getURL: (p) => `chrome-extension://stub/${p}`,
+      getManifest: () => ({ version: pkg.version }),
     },
     alarms: {
       create: (name, info) => alarms.set(name, info),

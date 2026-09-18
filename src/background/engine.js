@@ -35,9 +35,18 @@ export function invalidate(sym) {
  * Recompute (or reuse) the signal for `sym`, act on newly closed bars and
  * settle expired paper trades. Safe to call every second.
  *
+ * @param {object} [opts]
+ * @param {boolean} [opts.trade]    may this call open a paper trade / write a
+ *   journal event? Only the symbol the user is watching may (see index.js's
+ *   candidate pass) — otherwise "auto paper trade" would also stake money on
+ *   every pair the ranker looks at.
+ * @param {boolean} [opts.preview]  compute the forming-bar preview (the most
+ *   expensive part; the panel needs it, a background candidate does not).
+ * @param {boolean} [opts.settle]   run the ledger sweep. It is idempotent, but
+ *   it does not need to run once per candidate per second.
  * @returns {{signal:object|null, open:Array, settled:Array, newBar:boolean}}
  */
-export function evaluate(sym, settings) {
+export function evaluate(sym, settings, { trade = true, preview: wantPreview = true, settle = true } = {}) {
   const s = store.getSymbol(sym);
   if (!s) return { signal: null, open: [], settled: [], newBar: false };
 
@@ -58,10 +67,13 @@ export function evaluate(sym, settings) {
   // seriesOf gives the ledger the candle history so a settlement made after a
   // service-worker restart can use the price AT expiry rather than the price
   // whenever the worker happened to wake up. See ledger.priceAtExpiry.
-  const settled = ledger.settleAllDue(lastPrice, now, (sym) => {
-    const x = store.getSymbol(sym);
-    return x ? { m1: x.tf.m1, ts: x.ts } : null;
-  });
+  const settled = settle
+    ? ledger.settleAllDue(lastPrice, now, (sym) => {
+        const x = store.getSymbol(sym);
+        return x ? { m1: x.tf.m1, ts: x.ts } : null;
+      })
+    : [];
+  if (!trade) store.diag.candidates = (store.diag.candidates || 0) + 1;
 
   const assetClass = s.assetClass || 'unknown';
   const data = {
@@ -89,9 +101,9 @@ export function evaluate(sym, settings) {
 
   const sig = signal.signal;
 
-  if (newBar && sig && (sig.dir === 'up' || sig.dir === 'down')) {
+  if (trade && newBar && sig && (sig.dir === 'up' || sig.dir === 'down')) {
     maybeTrade(sym, sig, { settings, price, payout, source: s.source, assetClass, otc: !!s.otc });
-  } else if (newBar && sig?.dir === 'veto') {
+  } else if (trade && newBar && sig?.dir === 'veto') {
     ledger.logEvent('veto', `${sym} blocked — ${sig.vetoes[0]}`);
   }
 
@@ -102,7 +114,7 @@ export function evaluate(sym, settings) {
   const formingOpen = m1.length ? m1[m1.length - 1].t : 0;
   const secondsToClose = formingOpen ? Math.max(0, Math.ceil((formingOpen + tfMs - Date.now()) / 1000)) : 0;
   let preview = null;
-  if (m1.length >= 40) {
+  if (wantPreview && m1.length >= 40) {
     preview = analyze(data, { ...settings.strategy, preview: true });
   }
 

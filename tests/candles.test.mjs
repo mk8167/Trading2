@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   TF_MS, bucketOf, upsertCandle, makeSeries, pushTick, aggregate, deriveAll,
-  compact, expand, normaliseTs, formatPrice, secondsToClose, isCandle,
+  compact, expand, normaliseTs, formatPrice, secondsToClose, isCandle, lastOf,
 } from '../src/background/candles.js';
 
 const MIN = 1_699_999_980_000; // an exact multiple of 60_000
@@ -49,6 +49,40 @@ test('pushTick aggregates ticks into one-minute bars', () => {
   pushTick(s, 1.2, base + 61_000);
   assert.equal(s.length, 2);
   assert.equal(s[1].t, base + 60_000);
+});
+
+test('a late tick never appends a bar behind the newest one', () => {
+  // Ticks can arrive out of order (the socket delivered them late, or a frame
+  // carried a clock a few seconds behind). Appending the older bucket put a bar
+  // at the END of the series whose timestamp was in the past: lastOf() then
+  // reported a stale price as the newest one, and aggregate() emitted a 5m
+  // bucket that ran backwards.
+  const s = makeSeries(TF_MS.m1);
+  pushTick(s, 1.10, MIN + 1000);
+  pushTick(s, 1.11, MIN + 61_000);
+  pushTick(s, 1.12, MIN + 121_000);
+  const sortedBefore = s.map((c) => c.t);
+
+  // Ten seconds into the previous minute — inside store.ingestTick's tolerance.
+  assert.equal(pushTick(s, 1.99, MIN + 70_000), true, 'the tick still lands in its own bar');
+  assert.deepEqual(s.map((c) => c.t), sortedBefore, 'no bar was appended out of order');
+  assert.equal(s.length, 3);
+  assert.equal(s[1].h, 1.99, 'the high of its own bar was extended');
+  assert.equal(s[1].l, 1.11, 'the low is untouched');
+  assert.equal(s[1].c, 1.11, 'the close of a finished bar is history and is not rewritten');
+  assert.equal(lastOf(s).t, MIN + 120_000, 'the newest bar is still the last bar');
+
+  const m5 = aggregate(s, TF_MS.m5);
+  for (let i = 1; i < m5.length; i++) assert.ok(m5[i].t > m5[i - 1].t, 'aggregated buckets must stay ordered');
+});
+
+test('a tick older than anything we still hold is dropped, not appended', () => {
+  const s = makeSeries(TF_MS.m1);
+  pushTick(s, 1.10, MIN + 121_000);
+  pushTick(s, 1.11, MIN + 181_000);
+  assert.equal(pushTick(s, 9.99, MIN), false, 'a bucket we no longer hold cannot be invented');
+  assert.equal(s.length, 2);
+  assert.equal(s[0].t, MIN + 120_000);
 });
 
 test('pushTick ignores junk prices', () => {

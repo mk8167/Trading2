@@ -55,6 +55,29 @@ export function wilsonLowerBound(wins, n, z = 1.96) {
   return Math.max(0, Math.min(1, lb));
 }
 
+/**
+ * Which pairs are worth scoring beyond the one on screen?
+ *
+ * The ranker's largest component is the live signal, and a signal only exists
+ * for a pair the engine has evaluated. Evaluating all 64 store slots every
+ * heartbeat would be wasteful, so this picks the strongest few: live data,
+ * enough closed candles to compute on, most-ticked first (store.listSymbols()
+ * already orders rows that way). Pure, so the choice can be tested directly.
+ *
+ * @param {Array} rows     rows from store.listSymbols()
+ * @param {object} [opts]
+ * @param {string|null} [opts.exclude]  the pair already being evaluated
+ * @param {number} [opts.limit]
+ * @param {number} [opts.minBars]  same floor the ranker uses
+ * @returns {string[]} canonical symbol keys
+ */
+export function candidatesToScore(rows, { exclude = null, limit = 6, minBars = 40 } = {}) {
+  return (rows || [])
+    .filter((x) => x && x.sym && x.sym !== exclude && !x.stale && (x.bars || 0) >= minBars)
+    .slice(0, Math.max(0, limit))
+    .map((x) => x.sym);
+}
+
 /** How trustworthy is the data behind this pair? 0..1 */
 function qualityScore(s) {
   // Source: the broker's own socket is the truth; REST proxies lag.
@@ -121,6 +144,8 @@ export function recommend(symbols, trades, deps = {}) {
     openSymbols = [],
     now = Date.now(),
     limit = 8,
+    minBars = 40,
+    fallbackPayout = 86,
   } = deps;
 
   const strat = settings.strategy || {};
@@ -133,7 +158,7 @@ export function recommend(symbols, trades, deps = {}) {
 
   for (const s of symbols || []) {
     if (!s || typeof s !== 'object' || !s.sym) continue; // junk row, not a crash
-    const row = assess(s, { signalOf, payoutOf, history, minPayout, minScore, now, open: openSymbols });
+    const row = assess(s, { signalOf, payoutOf, history, minPayout, minScore, minBars, fallbackPayout, now, open: openSymbols });
     if (row.eligible) ranked.push(row);
     else ineligible.push(row);
   }
@@ -145,7 +170,7 @@ export function recommend(symbols, trades, deps = {}) {
 }
 
 /** Score one instrument, or explain precisely why it cannot be traded. */
-function assess(s, { signalOf, payoutOf, history, minPayout, minScore, now, open }) {
+function assess(s, { signalOf, payoutOf, history, minPayout, minScore, minBars, fallbackPayout, now, open }) {
   const sym = s.sym;
   const assetClass = s.assetClass || 'unknown';
   const pretty = s.pretty || prettyName(sym);
@@ -155,11 +180,15 @@ function assess(s, { signalOf, payoutOf, history, minPayout, minScore, now, open
   // then the user's global setting. Inventing 86% here would let a pair
   // paying 60% pass a floor it cannot actually clear.
   const pay = payoutOf(sym);
+  // `settings` used to be referenced here without ever being in scope: any
+  // caller whose payoutOf returned nothing (or that omitted it, as the default
+  // does) crashed with a ReferenceError the moment a row had no payout of its
+  // own. The caller now passes the number explicitly.
   const payout = Number.isFinite(pay?.payout) && pay.payout > 0
     ? pay.payout
     : Number.isFinite(s.payout) && s.payout > 0
       ? s.payout
-      : Number(settings.payout) || 86;
+      : Number(fallbackPayout) || 86;
   const be = breakEvenWinRate(payout);
   const h = history.get(sym) || { n: 0, wins: 0, lb: 0 };
 
@@ -187,7 +216,7 @@ function assess(s, { signalOf, payoutOf, history, minPayout, minScore, now, open
 
   /* ---- hard filters: each one is a fact, not a preference ---- */
   if (s.stale) return { ...base, reasons: ['No live data — feed is stale'] };
-  if ((s.bars || 0) < 40) return { ...base, reasons: [`Only ${s.bars || 0}/40 closed candles — still warming up`] };
+  if ((s.bars || 0) < minBars) return { ...base, reasons: [`Only ${s.bars || 0}/${minBars} closed candles — still warming up`] };
 
   const closed = !marketOpen(assetClass, now);
   if (closed) return { ...base, reasons: [closedReason(assetClass, now) || 'Market closed'] };

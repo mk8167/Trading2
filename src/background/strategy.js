@@ -329,6 +329,22 @@ export function breakEvenWinRate(payoutPct) {
 }
 
 /**
+ * Did this trade actually decide anything?
+ *
+ * Only 'win' and 'loss' carry evidence. An open trade has not finished, a
+ * 'void' never obtained a settlement price, and a 'tie' returned the stake —
+ * counting any of them in a denominator turns the win rate into a function of
+ * how many trades happen to be in flight rather than of how often the strategy
+ * is right.
+ *
+ * journal.isDecided() is the same rule. It is repeated here (four words) rather
+ * than imported because journal.js already imports breakEvenWinRate() from
+ * this module, and an import cycle between the two would be a worse trade than
+ * the duplication. tests/strategy.test.mjs asserts the two agree.
+ */
+export const isDecided = (t) => !!t && (t.result === 'win' || t.result === 'loss');
+
+/**
  * Decide whether a fresh signal is allowed to become a paper trade.
  * @returns {{ok:boolean, reason?:string}}
  */
@@ -339,22 +355,29 @@ export function gate({ signal, trades = [], payout, now = Date.now(), opts = {} 
   }
   if (signal.score < o.minScore) return { ok: false, reason: `Score ${signal.score} < ${o.minScore}` };
 
+  const rows = trades || [];
   const be = breakEvenWinRate(payout);
   if (o.gateEnabled) {
-    const recent = trades.slice(-o.gateLookback);
+    // The window is the last N *decided* trades, not the last N rows. Counting
+    // every row meant trades that had not finished — or that were voided, or
+    // that returned their stake — landed in the denominator, so 9 wins and 3
+    // losses alongside 8 just-opened trades read as 45% and the gate stopped
+    // trading a strategy that was comfortably above break-even. The journal
+    // already excluded these (journal.isDecided); the live gate did not.
+    const recent = rows.filter(isDecided).slice(-o.gateLookback);
     if (recent.length >= Math.max(8, o.gateLookback / 2)) {
       const wr = recent.filter((t) => t.result === 'win').length / recent.length;
       if (wr < be + o.gateMargin) {
         return { ok: false, reason: `GATE — win rate ${(wr * 100).toFixed(0)}% < ${((be + o.gateMargin) * 100).toFixed(0)}% break-even+margin` };
       }
     }
-    const streak = lossStreak(trades);
+    const streak = lossStreak(rows);
     if (o.maxLossStreak && streak >= o.maxLossStreak) {
       return { ok: false, reason: `GATE — ${streak} losses in a row, stop and review` };
     }
   }
 
-  const lastSameDir = [...trades].reverse().find((t) => t.dir === signal.dir);
+  const lastSameDir = [...rows].reverse().find((t) => t.dir === signal.dir);
   if (lastSameDir && now - lastSameDir.openedAt < o.cooldownMs) {
     const mins = Math.max(1, Math.round((o.cooldownMs - (now - lastSameDir.openedAt)) / 60000));
     return { ok: false, reason: `Cooldown — last ${signal.dir} signal ${mins}m ago` };
@@ -362,10 +385,20 @@ export function gate({ signal, trades = [], payout, now = Date.now(), opts = {} 
   return { ok: true };
 }
 
+/**
+ * Consecutive losses at the end of the journal.
+ *
+ * Undecided rows are skipped rather than allowed to break the run: a void (or
+ * a tie, or a trade opened seconds ago) is not evidence that the losing streak
+ * ended, and letting it terminate the count would make "5 losses in a row,
+ * stop and review" disappear exactly when a pair's feed went quiet.
+ */
 export function lossStreak(trades) {
   let n = 0;
-  for (let i = trades.length - 1; i >= 0; i--) {
-    if (trades[i].result === 'loss') n++;
+  const rows = trades || [];
+  for (let i = rows.length - 1; i >= 0; i--) {
+    if (!isDecided(rows[i])) continue;
+    if (rows[i].result === 'loss') n++;
     else break;
   }
   return n;
@@ -373,8 +406,10 @@ export function lossStreak(trades) {
 
 export function winStreak(trades) {
   let n = 0;
-  for (let i = trades.length - 1; i >= 0; i--) {
-    if (trades[i].result === 'win') n++;
+  const rows = trades || [];
+  for (let i = rows.length - 1; i >= 0; i--) {
+    if (!isDecided(rows[i])) continue;
+    if (rows[i].result === 'win') n++;
     else break;
   }
   return n;

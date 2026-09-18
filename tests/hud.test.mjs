@@ -77,8 +77,11 @@ class El {
 }
 
 /** Boot the content script in a fresh fake page. */
-function makePage({ settings = { hud: { enabled: true, side: 'right' } }, state = null, boot = true } = {}) {
+function makePage({ settings = { hud: { enabled: true, side: 'right' } }, state = null, boot = true, globals = {} } = {}) {
   const sent = [];
+  /* state.get callbacks, so a test can drive a second render the way the
+   * 1-second poll does. */
+  const polls = [];
   const doc = new El('body');
   doc.body = doc;
   doc.documentElement = doc;
@@ -99,12 +102,16 @@ function makePage({ settings = { hud: { enabled: true, side: 'right' } }, state 
           sent.push(msg);
           if (!cb) return;
           if (msg.cmd === 'settings.get') cb({ ok: true, settings });
-          if (msg.cmd === 'state.get' && state) cb(state);
+          if (msg.cmd === 'state.get') {
+            polls.push(() => state && cb(state));
+            if (state) cb(state);
+          }
         },
         onMessage: { addListener: (fn) => (sandbox.__onMsg = fn) },
       },
     },
   };
+  Object.assign(sandbox, globals);
   sandbox.window = sandbox;
   sandbox.globalThis = sandbox;
   sandbox.innerWidth = 1200;
@@ -123,7 +130,9 @@ function makePage({ settings = { hud: { enabled: true, side: 'right' } }, state 
     for (const [t, fn] of sandbox.__listeners) if (t === 'message') fn({ source, data });
   };
   const shadow = () => doc.children[0]?._shadow;
-  return { sandbox, doc, sent, fire, shadow, guestWindow };
+  /** Re-run the poll the 1-second heartbeat would run. */
+  const repoll = () => polls.forEach((fn) => fn());
+  return { sandbox, doc, sent, fire, shadow, guestWindow, repoll };
 }
 
 const candles = (n = 80, base = 1.08) =>
@@ -248,4 +257,130 @@ test('hud.toggle from the worker shows and hides the widget', () => {
   assert.equal(doc.children[0].style.display, '', 'visible');
   sandbox.__onMsg({ cmd: 'hud.toggle' }, null, () => {});
   assert.equal(doc.children[0].style.display, 'none', 'hidden');
+});
+
+/* --------------------------- signal alert tone ------------------------ */
+
+/** A stand-in for WebAudio that records what the HUD asked it to play. */
+function fakeAudio() {
+  const played = [];
+  class AudioContext {
+    constructor() {
+      this.state = 'running';
+      this.currentTime = 0;
+      this.destination = { name: 'destination' };
+    }
+    resume() { return Promise.resolve(); }
+    createOscillator() {
+      return {
+        type: '',
+        frequency: { setValueAtTime: (hz, at) => played.push({ hz, at }) },
+        connect() {},
+        start() { played.push({ started: true }); },
+        stop() {},
+      };
+    }
+    createGain() {
+      return { gain: { setValueAtTime() {}, exponentialRampToValueAtTime() {} }, connect() {} };
+    }
+  }
+  return { AudioContext, played };
+}
+
+/** A state payload whose signal is on a specific closed bar. */
+function stateOnBar(at, dir = 'up', over = {}) {
+  const s = liveState(dir);
+  s.signal.ctx = { ...s.signal.ctx, at };
+  return Object.assign(s, over);
+}
+
+test('a sound alert fires once per new closed-bar signal, and only if asked', () => {
+  const audio = fakeAudio();
+  const state = stateOnBar(1_000, 'up');
+  state.settings = { tf: 'm1', hud: { side: 'right' }, alerts: { sound: true } };
+  const { repoll } = makePage({ state, globals: { AudioContext: audio.AudioContext } });
+
+  // Building the widget is not a signal: the first render must stay silent.
+  assert.equal(audio.played.length, 0, 'no beep just because the HUD appeared');
+
+  // A new closed bar with a direction is the event the setting promises.
+  state.signal.ctx.at = 2_000;
+  repoll();
+  assert.equal(audio.played.filter((p) => p.started).length, 1, 'one tone on the new bar');
+
+  // The same bar again (the poll runs every second) must not re-trigger it.
+  repoll();
+  repoll();
+  assert.equal(audio.played.filter((p) => p.started).length, 1, 'one tone per bar, not one per second');
+
+  // A non-directional verdict says nothing to act on, so it stays quiet.
+  state.signal.ctx.at = 3_000;
+  state.signal.dir = 'none';
+  repoll();
+  assert.equal(audio.played.filter((p) => p.started).length, 1, 'no tone for "no edge"');
+});
+
+test('nothing is played when the sound setting is off', () => {
+  const audio = fakeAudio();
+  const state = stateOnBar(1_000, 'up');
+  state.settings = { tf: 'm1', hud: { side: 'right' }, alerts: { sound: false } };
+  const { repoll } = makePage({ state, globals: { AudioContext: audio.AudioContext } });
+  state.signal.ctx.at = 2_000;
+  repoll();
+  assert.equal(audio.played.length, 0);
+});
+
+test('a missing or suspended AudioContext cannot break the render', () => {
+  const state = stateOnBar(1_000, 'up');
+  state.settings = { tf: 'm1', hud: { side: 'right' }, alerts: { sound: true } };
+  const { repoll, shadow } = makePage({ state }); // no AudioContext in this page
+  state.signal.ctx.at = 2_000;
+  assert.doesNotThrow(() => repoll());
+  assert.equal(shadow().getElementById('px').textContent, '1.09650', 'the widget still renders');
+});
+
+/* ------------------------- settings that were inert -------------------- */
+
+test('the collapsed state and the hint line come from settings', () => {
+  const { shadow } = makePage({ settings: { hud: { enabled: true, side: 'right', compact: true } }, state: liveState() });
+  const sh = shadow();
+  assert.equal(sh.querySelector('.panel').classList.contains('collapsed'), true, 'hud.compact must survive a reload');
+  assert.equal(sh.getElementById('fold').textContent, '+');
+});
+
+test('hud.showChart false hides the sparkline instead of drawing it', () => {
+  const state = liveState();
+  state.settings = { tf: 'm1', hud: { side: 'right', showChart: false }, alerts: {} };
+  const { shadow } = makePage({ state });
+  assert.equal(shadow().getElementById('spark').style.display, 'none');
+  assert.equal(shadow().getElementById('pair').textContent, 'EUR/USD · OTC · m1', 'the rest of the widget is untouched');
+});
+
+test('outbound page frames are not treated as market data', () => {
+  const { fire, sent } = makePage({ state: liveState() });
+  // The bridge relays both halves of the conversation; only the server's half
+  // is market data. A page's own frames used to be queued as if the broker had
+  // sent them — including subscriptions that carry a symbol and a number.
+  for (let i = 0; i < 60; i++) fire({ __qsync_v6: 1, kind: 'frame', text: `42["subscribe",{"symbol":"EURUSD_otc"},${i}]`, dir: 'out' });
+  assert.equal(sent.filter((m) => m.cmd === 'feed.batch').length, 0, '60 outbound frames must not even fill a batch');
+
+  for (let i = 0; i < 60; i++) fire({ __qsync_v6: 1, kind: 'frame', text: `42["tick",["EURUSD_otc",1700000000,1.08,1]]`, dir: 'in' });
+  const batches = sent.filter((m) => m.cmd === 'feed.batch');
+  assert.equal(batches.length, 1, 'the batch cap flushes the queue');
+  assert.equal(batches[0].frames.length, 60, 'only inbound frames are queued');
+  assert.ok(batches[0].frames.every((f) => /"tick"/.test(f.text)), 'none of them is a subscription');
+});
+
+test('the m15 selection shows m15 candles, not 1-minute ones', () => {
+  const state = liveState();
+  state.settings = { tf: 'm15', payout: 86, hud: { side: 'right' } };
+  state.candles.m15 = [
+    { t: Date.now() - 60_000, o: 1, h: 1.1, l: 0.9, c: 1.05 },
+    { t: Date.now() + 300_000, o: 1.05, h: 1.2, l: 1.0, c: 1.1 },
+  ];
+  const { shadow } = makePage({ state });
+  const sh = shadow();
+  assert.equal(sh.getElementById('pair').textContent, 'EUR/USD · OTC · m15');
+  // 15m bars: the countdown must be minutes away, not a rolling 60 seconds.
+  assert.ok(Number(sh.getElementById('clk').textContent.replace('s', '')) > 60, 'm15 clock, not the m1 clock');
 });

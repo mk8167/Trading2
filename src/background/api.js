@@ -294,6 +294,9 @@ async function stateGet(msg) {
       // broker-owned series, and how often the broker took a series back.
       proxyRefusals: store.diag.proxyRefusals || 0,
       sourceTakeovers: store.diag.sourceTakeovers || 0,
+      // Pairs scored beyond the one on screen. Without this the "best pair"
+      // board would rank on a signal it never computed.
+      candidates: store.diag.candidates || 0,
       bridges: store.diag.bridges.size,
       pairs: store.symbols.size,
       lastFrameAge: store.diag.lastFrameAt ? Date.now() - store.diag.lastFrameAt : null,
@@ -322,8 +325,16 @@ function buildSync(st, tf, now) {
 }
 
 function journalPayload(s) {
+  // Break-even has to come from the payouts the ledger actually traded at, not
+  // from whatever number happens to sit in Settings. A run settled at a 75%
+  // payout needs 57.1% wins; printing the 86% default's 53.8% hands the user a
+  // 3.3-point "edge" that the trades never had. stats() falls back to the mean
+  // payout of the decided trades when it is not told one, so the setting is
+  // only passed in when there is nothing to average yet.
+  const hasDecided = ledger.trades.some((t) => t.result === 'win' || t.result === 'loss');
+  const fallbackPayout = hasDecided ? undefined : Number.isFinite(s.payout) ? s.payout : 86;
   return {
-    ...ledger.summary(Number.isFinite(s.payout) ? s.payout : 86),
+    ...ledger.summary(fallbackPayout),
     recent: ledger.trades.slice(-40).reverse(),
     events: ledger.events.slice(0, 30),
     breakdown: {
@@ -358,11 +369,18 @@ function buildCatalog() {
  */
 function recommendPairs(settings) {
   try {
+    // settings.recommend was documented ("how many pairs the list shows", "how
+    // many closed candles a pair needs") but never handed to the ranker, so the
+    // numbers in the Settings schema were decorative.
+    const cfg = settings.recommend || {};
     return recommend(store.listSymbols(), ledger.trades, {
       settings,
       signalOf: (sym) => engine.currentSignal(sym),
       payoutOf: (sym) => store.effectivePayout(sym, settings.payout),
       openSymbols: ledger.openSymbols(),
+      limit: cfg.limit ?? 8,
+      minBars: cfg.minBars ?? 40,
+      fallbackPayout: settings.payout,
     });
   } catch (e) {
     store.noteError(`recommend: ${e?.message || e}`);

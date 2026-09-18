@@ -86,19 +86,25 @@ function drawChart(d) {
   const tf = d.settings?.tf === 'm15' ? 'm15' : d.settings?.tf === 'm5' ? 'm5' : 'm1';
   const cs = d.candles?.[tf] || [];
   const closes = cs.map((c) => c.c);
+  const cfg = d.settings?.chart || {};
   const overlays = [];
   const palette = ['#f5c33b', '#4ea1ff', '#c084fc'];
-  (d.settings?.chart?.ema || [9, 21]).forEach((n, i) => {
+  (cfg.ema || [9, 21]).forEach((n, i) => {
     overlays.push({ name: `EMA${n}`, color: palette[i % palette.length], values: ema(closes, n) });
   });
   const markers = (d.journal?.recent || [])
     .filter((t) => t.sym === d.selectedSym)
     .map((t) => ({ t: t.openedAt, dir: t.dir }));
+  // settings.chart.* was in the schema but only .ema was read, so "how many
+  // candles the chart shows" and the level/marker switches did nothing. The
+  // wheel-zoom limits the renderer enforces are reused here so a hand-edited
+  // value cannot ask for a 5000-bar chart.
+  if (Number.isFinite(cfg.candles)) chart.visible = Math.min(400, Math.max(20, Math.round(cfg.candles)));
   chart.setData({
     candles: cs,
     overlays,
-    levels: (d.signal?.ctx?.levels || []).map((l) => ({ price: l.price, kind: l.kind })),
-    markers,
+    levels: cfg.levels === false ? [] : (d.signal?.ctx?.levels || []).map((l) => ({ price: l.price, kind: l.kind })),
+    markers: cfg.markers === false ? [] : markers,
   });
 }
 
@@ -525,6 +531,7 @@ function renderFeed(d) {
     // be able to see that here rather than wonder why a chart jumped.
     ['Proxy refused', g.proxyRefusals ?? 0, 'delayed feeds kept out of live series'],
     ['Broker takeovers', g.sourceTakeovers ?? 0, 'series reset when the broker arrived'],
+    ['Candidates scored', g.candidates ?? 0, 'pairs ranked beyond the one on screen'],
   ]
     // `s || ''` so a row that forgets its sub-label renders empty rather than
     // the literal word "undefined" — which is exactly what 'Last frame' did.
@@ -802,6 +809,15 @@ $('btWalk').addEventListener('click', async () => {
 });
 
 /* -------------------------------- boot ------------------------------- */
+
+/* The header used to print a version typed into the HTML, which had been wrong
+ * for two releases. Read it from the manifest instead so it cannot drift. */
+try {
+  const ver = $('ver');
+  if (ver) ver.textContent = 'v' + chrome.runtime.getManifest().version;
+} catch {
+  /* the manifest is always there in a real extension; a stub may not have it */
+}
 
 connect();
 send('state.get').then((r) => r?.ok && apply(r));

@@ -53,21 +53,44 @@ export function upsertCandle(arr, c, cap = 0) {
 
 /**
  * Feed a raw tick into a series, creating/extending the bar that owns `ts`.
- * Out-of-order ticks still update high/low of their own bar.
+ *
+ * The series must stay sorted — `lastOf`, `aggregate`, the engine's "last
+ * closed bar" and the chart all assume `arr[i].t` increases. A tick that
+ * arrives late (the socket delivered it out of order, or it carried a clock a
+ * few seconds behind) belongs to an OLDER bucket, and appending it produced a
+ * bar at the end whose timestamp was in the past: the newest candle stopped
+ * being the last one, and aggregating the series to 5m emitted buckets that ran
+ * backwards. So a late tick updates the bar that owns it when that bar is still
+ * in the buffer (high/low only — its close is history and is not rewritten) and
+ * is otherwise dropped.
  */
 export function pushTick(arr, price, ts = Date.now(), cap = 0) {
   if (!Number.isFinite(price) || price <= 0) return false;
   const t = normaliseTs(ts);
+  const b = bucketOf(t, TF_MS_OF(arr));
   const last = lastOf(arr);
-  if (last && bucketOf(t, TF_MS_OF(arr)) === last.t) {
+  if (!last || b > last.t) {
+    arr.push({ t: b, o: price, h: price, l: price, c: price });
+    if (cap > 0) trim(arr, cap);
+    return true;
+  }
+  if (b === last.t) {
     if (price > last.h) last.h = price;
     if (price < last.l) last.l = price;
     last.c = price;
     return true;
   }
-  arr.push({ t: bucketOf(t, TF_MS_OF(arr)), o: price, h: price, l: price, c: price });
-  if (cap > 0) trim(arr, cap);
-  return true;
+  // Older than the newest bar: fold it into its own bar if we still hold it.
+  for (let i = arr.length - 2; i >= 0; i--) {
+    const c = arr[i];
+    if (c.t === b) {
+      if (price > c.h) c.h = price;
+      if (price < c.l) c.l = price;
+      return true;
+    }
+    if (c.t < b) break; // sorted series: an exact match would have appeared already
+  }
+  return false;
 }
 
 /* pushTick needs the series' own bucket size; callers tag it once. */

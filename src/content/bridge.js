@@ -17,6 +17,11 @@
   const NS = '__qsync_v6';
   const MAX_TEXT = 200 * 1024; // never relay a megabyte-sized frame
   const MAX_BODY = 512 * 1024;
+  // Binary frames are base64'd before they cross the world boundary, so a 4 MB
+  // buffer becomes a 5.3 MB string — copied into the page's message queue and
+  // then into an extension message. The parser refuses anything over 256 KB
+  // anyway, so relaying it would be pure waste; drop it here instead.
+  const MAX_BINARY = 256 * 1024;
   const HISTORY_URL = /histor|candle|chart|quote|instrument|asset/i;
 
   const post = (kind, payload) => {
@@ -43,6 +48,7 @@
         return;
       }
       if (data instanceof ArrayBuffer) {
+        if (data.byteLength > MAX_BINARY) return; // not a tick; see MAX_BINARY
         post('frame', { b64: toBase64(new Uint8Array(data)), url, binary: true, len: data.byteLength, dir });
         return;
       }
@@ -52,6 +58,7 @@
         return;
       }
       if (ArrayBuffer.isView(data)) {
+        if (data.byteLength > MAX_BINARY) return;
         const view = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
         post('frame', { b64: toBase64(view), url, binary: true, len: view.byteLength, dir });
       }

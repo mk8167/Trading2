@@ -11,7 +11,10 @@ export const DEFAULTS = {
   riskPct: 1,
   payout: 86,
   autoPaperTrade: true,
-  alerts: { sound: false, desktop: true, minConfidence: 60, onlyDirectional: true },
+  // `alerts.onlyDirectional` used to live here. Nothing read it: only a
+  // directional signal can become a trade, so "only notify on a direction" was
+  // a switch that could not change any behaviour.
+  alerts: { sound: false, desktop: true, minConfidence: 60 },
   strategy: {
     minScore: 3,
     minPayout: 70,

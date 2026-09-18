@@ -14,12 +14,29 @@ import * as ledger from './ledger.js';
 import * as settings from './settings.js';
 import * as engine from './engine.js';
 import { handleMessage } from './api.js';
+import { candidatesToScore } from './recommend.js';
 import * as binance from './feeds/binance.js';
 import * as yahoo from './feeds/yahoo.js';
 import { canonical } from './symbols.js';
 
 const HEARTBEAT_MS = 1000;
 const SNAPSHOT_KEY = 'market.snapshot.v6';
+
+/**
+ * How many pairs beyond the one on screen the heartbeat scores.
+ *
+ * The "best pair right now" board ranks on four components, the largest of
+ * which (40 of 100 points) is the live signal. With only the selected symbol
+ * ever evaluated, every other pair scored 0 there and was captioned "No
+ * directional signal right now" — a statement about the engine, not about the
+ * market — so the ranker could only ever justify the pair the user was already
+ * looking at. Scoring a bounded set costs little: the signal itself is cached
+ * per closed bar, so on a quiet bar this is a timestamp comparison.
+ */
+const CANDIDATE_LIMIT = 6;
+/** Closed candles a pair needs before the strategy can say anything about it. */
+const CANDIDATE_MIN_BARS = 40;
+
 let heartbeat = null;
 let last = { snapshot: 0, binance: 0, yahoo: 0, housekeep: 0, boot: 0 };
 let booted = false;
@@ -123,6 +140,18 @@ async function tick() {
     }
   }
 
+  // Signal-only pass over the strongest other pairs, so "which pair should I
+  // trade" is answered with evidence rather than with a blank where the
+  // signal component should be. trade:false means these can never open a paper
+  // trade, never write a journal event and never run the ledger sweep.
+  for (const cand of candidates(sym)) {
+    try {
+      engine.evaluate(cand, s, { trade: false, preview: false, settle: false });
+    } catch (e) {
+      store.noteError(`evaluate ${cand}: ${e?.message || e}`);
+    }
+  }
+
   if (s.feeds?.binance && now - last.binance >= (s.feeds.binanceMs || 30_000)) {
     last.binance = now;
     for (const pair of binance.pairsToPoll()) binance.poll(pair);
@@ -152,6 +181,19 @@ async function tick() {
 }
 
 const lastYahooStamp = {};
+
+/**
+ * Pairs worth scoring beyond `exclude` — live, with enough closed candles to
+ * compute on, most-ticked first. Selection lives in recommend.js so it can be
+ * tested on its own; this is just the store lookup.
+ */
+function candidates(exclude = null) {
+  return candidatesToScore(store.listSymbols(), {
+    exclude,
+    limit: CANDIDATE_LIMIT,
+    minBars: CANDIDATE_MIN_BARS,
+  });
+}
 
 /* ---------------------------- messaging ----------------------------- */
 

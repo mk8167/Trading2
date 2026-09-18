@@ -1,4 +1,4 @@
-# ⚡ Q-Sync Pro — Market Signal Studio (v6.2.0)
+# ⚡ Q-Sync Pro — Market Signal Studio (v6.3.0)
 
 A Chrome MV3 extension that reads live market ticks straight from a broker page's own
 WebSocket, builds candles, scores multi-timeframe confluence signals, and keeps a
@@ -44,7 +44,27 @@ with `chrome.scripting.registerContentScripts()`. Reload the tab afterwards.
 | **Backtester** | none | Replays the identical strategy with next-bar-open entry (no look-ahead) |
 | **Chart** | 60 hand-drawn bars, blurry on HiDPI | DPR-aware canvas, EMA overlays, S/R lines, trade markers, crosshair, wheel zoom, drag pan |
 | **UI** | One floating div on every page | Floating HUD (shadow DOM) + side-panel dashboard + popup + options page |
-| **Tests** | none | **423 automated tests**, `npm test` |
+| **Tests** | none | **450 automated tests**, `npm test` |
+
+---
+
+## What changed from v6.2.0 → v6.3.0
+
+v6.2.0 made the feed honest. v6.3.0 is a full audit of the rest of the pipeline, and the
+theme that came out of it is **controls that were not connected to anything** — a risk gate
+reading trades that had not finished, a journal quoting a payout nobody traded at, a
+"best pair" board that could not see a signal on any pair but the one on screen, and eight
+settings that were saved and never read.
+
+| # | Problem | Fix |
+|---|---|---|
+| 1 | **The risk gate counted trades that had not happened yet.** The rolling win rate divided by every journal row in the lookback window, not by every *decided* trade. A 1-minute expiry is still in flight when the next bar closes, so open trades sat in the denominator alongside voids (no settlement price) and ties (stake returned). Proven with a script: 9 wins and 3 losses — 75%, comfortably above the 53.8% break-even — read as **45%** once eight trades were still open, and the gate stopped trading a strategy that was working. The journal had excluded these for two releases (`journal.isDecided`); the live gate had not. | The gate filters on the same predicate (`strategy.isDecided`, asserted equal to `journal.isDecided` by a test), and `lossStreak()` counts *through* an undecided row instead of letting a void reset the run — "5 losses in a row, stop and review" no longer disappears when a pair's feed gaps. |
+| 2 | **A late tick could append a bar from the past.** `candles.pushTick()` appended whenever the incoming bucket differed from the newest bar — including when it was *older*. The store accepts a tick up to 60 s behind the newest one, so an out-of-order frame left a bar at the **end** of the series whose timestamp was in the past: `lastOf()` reported a stale price as the newest, the engine's "last closed bar" was wrong, and `aggregate()` emitted a 5 m bucket that ran backwards (`-200000 o100 c101 · 100000 o102 c102 · -200000 o999 c999`). | A late tick updates the high/low of the bar that owns it, if that bar is still buffered, and is dropped otherwise. Its close is never rewritten, and `store.ingestTick()` no longer drags `s.price` / `s.ts` backwards — which would have made a live pair look stale and pointed settlement at the wrong price. |
+| 3 | **The journal's break-even came from a payout nobody traded at.** `journalPayload` handed the *settings* payout (86% by default) to `stats()`, so a ledger settled at a real 75% payout printed a 53.8% break-even instead of 57.1% — a 3.3-point "edge" that never existed. This is the same bug v6.1.0 fixed for the engine and v6.2.0 for classification, still live in the journal. | Break-even now comes from the mean payout of the decided trades; the user's setting is used only when there is nothing to average yet. Verified with a script: 57.1% / +2.9 pp, where it used to say 53.8% / +6.2 pp. |
+| 4 | **"BEST PAIR RIGHT NOW" could not see a signal on any pair but the one on screen.** The engine only ever evaluated the selected symbol, and the ranker's largest component is the live signal (40 of 100 points) — so every other pair scored 0 there and was captioned *"No directional signal right now"*, which is a statement about the engine, not about the market. The board could only ever justify the pair the user was already looking at. | The heartbeat scores up to six other live pairs with enough closed candles, in a **signal-only** pass (`trade:false, preview:false, settle:false`) — a candidate can never open a paper trade, write a journal event, or run the ledger sweep. `recommend.candidatesToScore()` is pure and tested; the count appears on the Feed tab as *Candidates scored*. |
+| 5 | **Eight settings were saved and read by nothing.** `alerts.sound`, `hud.compact`, `hud.showChart`, `chart.candles`, `chart.levels`, `chart.markers`, `recommend.limit`, `recommend.minBars` — declared, persisted, and (for the sound switch) shown as a checkbox in the UI. "Play a sound on signal" wrote a value with no consumer; a collapsed HUD came back expanded on every reload; the ranker ignored both of the numbers documented as *"how many pairs the list shows"* and *"closed candles a pair needs"*. `alerts.onlyDirectional` was a switch that could not change any behaviour. | Each is wired: the HUD plays a two-tone blip once per new closed-bar signal (lazy `AudioContext`, silent no-op where it is missing or still suspended), restores the collapsed state, honours the sparkline switch; the chart honours the bar count and the level/marker switches; the ranker takes the list size and warm-up floor. `alerts.onlyDirectional` is deleted, and `tests/settings-wiring.test.mjs` walks the defaults tree and fails when a key is added without a reader. |
+| 6 | **Three smaller lies.** The panel and options page printed **v6.0.0** — two releases stale — because the version was typed into the HTML. The HUD header printed the selected timeframe while drawing 1-minute candles and a 60-second clock, so `m15` contradicted the chart under it. The bridge relays both halves of the socket conversation, and the HUD queued the page's *own* outbound frames as if the broker had sent them; binary frames were base64-encoded with no size cap (a 4 MB buffer becomes a 5.3 MB string). | Versions are read from the manifest at runtime (a test forbids hardcoding one). The HUD charts the timeframe it names. Only inbound and REST frames are queued. Binary frames over 256 KB — which the parser refuses anyway — are dropped in the bridge. |
+| + | Coverage: the gate, the candle series, the journal break-even, the ranker's blind spot, the HUD switches and the bridge cap had **no tests**, which is why they could drift. | **450 tests across 21 files** (was 423 across 20). Every fix above was verified by reverting it and watching the new test fail. |
 
 ---
 
@@ -120,7 +140,8 @@ src/
     hud.js         ISOLATED world — batches frames to the worker, draws the
                    floating HUD inside a shadow root
   background/
-    index.js       service worker: boot, heartbeat, alarms, snapshotting
+    index.js       service worker: boot, heartbeat, alarms, snapshotting,
+                   signal-only scoring of the pairs that are not on screen
     api.js         the single message surface every UI talks to
     engine.js      one evaluation per closed bar; cached, so all UIs agree
     strategy.js    weighted confluence engine + risk gate
@@ -129,7 +150,8 @@ src/
     candles.js     timeframe aggregation, ring buffers, compact storage format
     symbols.js     ONE authority on instrument identity: canonical key,
                    asset class, volatility band, payout default, market hours
-    recommend.js   ranks the tradeable pairs and says which to trade, with reasons
+    recommend.js   ranks the tradeable pairs and says which to trade, with reasons;
+                   also picks which pairs the heartbeat should score
     store.js       symbol registry + serialize/deserialize snapshot
     ledger.js      paper-trading ledger on chrome.storage.local
     journal.js     expectancy, profit factor, drawdown, breakdowns, CSV
@@ -144,7 +166,7 @@ src/
     panel/         side-panel dashboard (Chart · Signal · Journal · Backtest · Feed · Settings)
     popup/         compact status
     options/       site access, data export/import, docs
-tests/             423 tests — run with `npm test`
+tests/             450 tests — run with `npm test`
 ```
 
 ### How the feed works
@@ -207,7 +229,7 @@ rules concur. Six net points with every rule pointing the same way = 100%.
 npm test
 ```
 
-423 tests across 20 files:
+450 tests across 21 files:
 
 - `settlement` — **expiry-accurate settlement**: the price nearest expiry wins, a bar still
   forming is never a close, a late worker settles on the expiry bar not the current price,
@@ -228,19 +250,25 @@ npm test
   zoom/pan clamps (each verified by mutation, so the assertions are not vacuous)
 - `patterns` — candle anatomy, every pattern geometry, pivots, S/R clustering, structure,
   break-and-retest, VWAP
-- `candles` — bucketing, aggregation, compact/expand round-trip
+- `candles` — bucketing, aggregation, compact/expand round-trip, and a late tick that can
+  neither reorder the series nor invent a bar behind it
 - `indicators` — correctness against hand-computed values, plus a budget check that a full
   indicator pass over 600 candles stays fast enough for a 1 s heartbeat
 - `quotex-parser` — real payload shapes, socket.io envelopes, binary/base64, hostile input
-- `strategy` — trend/flat behaviour, vetoes, gates, and the closed-bar guarantee
+- `strategy` — trend/flat behaviour, vetoes, gates, the closed-bar guarantee, and a risk
+  gate that counts decided trades rather than journal rows
 - `journal` — settlement, expectancy, drawdown, CSV escaping
 - `backtest` — **no look-ahead** (entry must equal the next bar's open), determinism, cooldown
 - `bridge` — the MAIN-world hook executed in a real `vm` context against a fake WebSocket
-- `hud` — the content script executed against a fake DOM, asserting rendered output
+- `hud` — the content script executed against a fake DOM, asserting rendered output, the
+  one-blip-per-bar sound alert, the collapsed state, and that outbound frames are not data
 - `integration` — frames pushed through the real message surface into the real worker
   modules with a stubbed `chrome.*`, ending in a settled paper trade
 - `symbols` — canonical keys, asset classification, per-class bands, weekend sessions
-- `recommend` — every hard filter, the Wilson lower bound, ranking determinism
+- `recommend` — every hard filter, the Wilson lower bound, ranking determinism, and which
+  pairs are worth scoring beyond the one on screen
+- `settings-wiring` — every key in the defaults tree is read by something; a setting that is
+  only saved (the old `alerts.sound`, `hud.compact`, `recommend.limit`, …) fails the suite
 - `lifecycle` — eviction/prune protection, the payout inbox, settlement and voiding
 
 ---

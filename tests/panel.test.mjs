@@ -11,6 +11,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { install, reset as resetChrome } from './chrome-stub.mjs';
 import { installDom } from './dom-stub.mjs';
 
@@ -253,4 +254,12 @@ test('the same renders cleanly on a sparse payload too', () => {
 
 test('the panel module exposes no accidental globals', () => {
   assert.equal(typeof panel, 'object');
+});
+
+test('the header shows the manifest version, not a hardcoded one', () => {
+  // The panel shipped "v6.0.0" for two releases. The manifest is the one place
+  // a version is defined, and this is the surface that prints it.
+  push(payload());
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+  assert.equal(get('ver').textContent, 'v' + pkg.version);
 });

@@ -66,6 +66,8 @@ export const diag = {
   proxyRefusals: 0,
   payoutsQueued: 0,
   payoutsApplied: 0,
+  /** Pairs scored beyond the one on screen, so the ranker has real signals. */
+  candidates: 0,
 };
 
 export function resetDiag() {
@@ -78,6 +80,7 @@ export function resetDiag() {
   diag.samples = [];
   diag.errors = [];
   diag.lastFrameAt = 0;
+  diag.candidates = 0;
 }
 
 export function noteError(msg) {
@@ -241,8 +244,15 @@ export function ingestTick(sym, price, ts = null, source = 'quotex', hint = null
   // candle builder appends only, so old data would corrupt the series.
   if (s.ts && t < s.ts - 60_000) return null;
   pushTick(s.tf.m1, price, t, DEFAULT_CAP.m1);
-  s.price = price;
-  s.ts = t;
+  // A tick that is merely late still lands in the bar it belongs to, but it
+  // must not drag the live quote backwards: s.ts is what settlement uses as
+  // "the feed's clock for this price" and what isStale() judges freshness by,
+  // so rewinding it would make a live pair look stale and a settlement pick
+  // the wrong price.
+  if (!s.ts || t >= s.ts) {
+    s.price = price;
+    s.ts = t;
+  }
   s.lastTickAt = Date.now();
   s.tickCount++;
   diag.ticks++;

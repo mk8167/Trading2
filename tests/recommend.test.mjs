@@ -13,6 +13,7 @@ import {
   recommend,
   wilsonLowerBound,
   historyBySymbol,
+  candidatesToScore,
   WEIGHTS,
   MIN_HISTORY,
 } from '../src/background/recommend.js';
@@ -271,4 +272,46 @@ test('the payout it reports is the one actually used for break-even', () => {
   assert.equal(r.best.payout, 74);
   assert.equal(r.best.payoutOrigin, 'live');
   assert.equal(r.best.breakEven, Math.round(breakEvenWinRate(74) * 10000) / 10000);
+});
+
+/* ------------------------- which pairs get scored ---------------------- */
+
+test('candidatesToScore only offers pairs the strategy can actually read', () => {
+  const rows = [
+    row({ sym: 'LIVE_A', bars: 200, stale: false }),
+    row({ sym: 'WARMING', bars: 12, stale: false }),
+    row({ sym: 'DEAD', bars: 400, stale: true }),
+    row({ sym: 'ONSCREEN', bars: 300, stale: false }),
+    row({ sym: 'LIVE_B', bars: 40, stale: false }),
+  ];
+  assert.deepEqual(candidatesToScore(rows, { exclude: 'ONSCREEN' }), ['LIVE_A', 'LIVE_B']);
+  // limit and minBars are the caller's, not magic numbers here.
+  assert.deepEqual(candidatesToScore(rows, { exclude: 'ONSCREEN', limit: 1 }), ['LIVE_A']);
+  assert.deepEqual(candidatesToScore(rows, { minBars: 10 }).includes('WARMING'), true);
+  assert.deepEqual(candidatesToScore(null), []);
+});
+
+test('a row with no payout of its own does not crash the ranker', () => {
+  // The fallback chain used to reference `settings`, which was never in scope:
+  // any caller that omitted payoutOf (as the default does) threw a
+  // ReferenceError as soon as a row carried no payout.
+  const r = recommend([row({ payout: null })], [], { now: WED, signalOf: () => sig('up') });
+  assert.ok(r.best, 'the pair should still be ranked');
+  assert.equal(r.best.payout, 86, 'falls back to the documented default');
+  const withSetting = recommend([row({ payout: null })], [], { now: WED, fallbackPayout: 80, signalOf: () => sig('up') });
+  assert.equal(withSetting.best.payout, 80, 'the caller can supply the user setting');
+});
+
+test('minBars from the caller overrides the warm-up floor', () => {
+  const short = recommend([row({ bars: 60 })], [], { now: WED, minBars: 100, signalOf: () => sig('up') });
+  assert.equal(short.best, null);
+  assert.match(short.ineligible[0].reasons[0], /60\/100 closed candles/);
+  const ok = recommend([row({ bars: 60 })], [], { now: WED, minBars: 50, signalOf: () => sig('up') });
+  assert.ok(ok.best);
+});
+
+test('limit caps the ranked list', () => {
+  const rows = Array.from({ length: 9 }, (_, i) => row({ sym: `PAIR${i}USD`, pretty: `P${i}/USD` }));
+  assert.equal(recommend(rows, [], { now: WED, signalOf: () => sig('up') }).ranked.length, 8);
+  assert.equal(recommend(rows, [], { now: WED, limit: 3, signalOf: () => sig('up') }).ranked.length, 3);
 });

@@ -37,6 +37,11 @@
     const d = ev.data;
     if (!d || d[NS] !== 1) return;
     if (d.kind === 'frame') {
+      // The bridge relays both halves of the conversation. Only the server's
+      // half is market data: the page's own outbound frames (subscriptions,
+      // auth, a history request that happens to look like a tick row) used to
+      // be queued here as if they had arrived from the broker.
+      if (d.dir === 'out') return;
       queue.push({ text: d.text, b64: d.b64, binary: !!d.binary, url: d.url });
       if (queue.length >= MAX_BATCH) flush();
       else if (!flushTimer) flushTimer = setTimeout(flush, FLUSH_MS);
@@ -170,9 +175,8 @@
     });
     el.shut.addEventListener('click', () => setVisible(false));
     el.fold.addEventListener('click', () => {
-      compact = !compact;
-      el.panel.classList.toggle('collapsed', compact);
-      el.fold.textContent = compact ? '+' : '–';
+      setCompact(!compact);
+      chrome.runtime.sendMessage({ cmd: 'settings.patch', patch: { hud: { compact } } }, () => void chrome.runtime.lastError);
     });
     el.flip.addEventListener('click', () => {
       side = side === 'right' ? 'left' : 'right';
@@ -187,6 +191,15 @@
     if (!el.panel) return;
     el.panel.classList.toggle('left', side === 'left');
     el.panel.classList.toggle('right', side === 'right');
+  }
+
+  /* settings.hud.compact was persisted and then never read, so a collapsed HUD
+   * came back expanded on every page load. */
+  function setCompact(on) {
+    compact = !!on;
+    if (!el.panel) return;
+    el.panel.classList.toggle('collapsed', compact);
+    if (el.fold) el.fold.textContent = compact ? '+' : '–';
   }
 
   function setVisible(v) {
@@ -287,6 +300,56 @@
     g.setLineDash([]);
   }
 
+  /* ------------------------- signal alert tone -------------------------
+   * "Play a sound on signal" in Settings wrote settings.alerts.sound and then
+   * nothing on any surface ever read it — a checkbox that did nothing.
+   * Notifications are already handled by the worker; sound has to happen in a
+   * page (a service worker cannot play audio without an offscreen document),
+   * so the HUD plays a short two-tone blip. AudioContext is created lazily and
+   * the call is a no-op wherever it is unavailable or still suspended by the
+   * autoplay policy — a missing beep must never break the widget.
+   * ------------------------------------------------------------------- */
+  let audio = null;
+  function blip(dir) {
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return false;
+      audio = audio || new Ctx();
+      if (audio.state === 'suspended' && audio.resume) audio.resume().catch(() => {});
+      const t0 = audio.currentTime;
+      const osc = audio.createOscillator();
+      const gain = audio.createGain();
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(dir === 'up' ? 880 : 440, t0);
+      osc.frequency.setValueAtTime(dir === 'up' ? 1174 : 330, t0 + 0.09);
+      gain.gain.setValueAtTime(0.0001, t0);
+      gain.gain.exponentialRampToValueAtTime(0.08, t0 + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.22);
+      osc.connect(gain);
+      gain.connect(audio.destination);
+      osc.start(t0);
+      osc.stop(t0 + 0.24);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /** Identity of the signal currently on screen — one blip per closed bar. */
+  let alertKey = null;
+
+  function maybeAlert(s, sig) {
+    const key = `${sig.ctx?.at ?? '?'}:${sig.dir}`;
+    const first = alertKey === null;
+    if (key === alertKey) return;
+    alertKey = key;
+    // Nothing on the first render: the widget just appeared, the bar did not.
+    if (first) return;
+    if (sig.dir !== 'up' && sig.dir !== 'down') return;
+    if (!s.settings?.alerts?.sound) return;
+    blip(sig.dir);
+  }
+
   function render() {
     if (!root || !state) return;
     const s = state;
@@ -312,6 +375,7 @@
     el.srcb.className = 'badge ' + (sym.stale ? 'dead' : sym.source === 'quotex' ? 'live' : 'idle');
 
     const sig = s.signal || { dir: 'wait', summary: 'no data' };
+    maybeAlert(s, sig);
     const st = DIR_STYLE[sig.dir] || DIR_STYLE.wait;
     el.sig.style.background = st.bg;
     el.sigd.textContent = st.label;
@@ -335,8 +399,15 @@
     const payout = Number.isFinite(sym.payout) ? sym.payout : s.settings?.payout;
     el.meta.textContent = 'pay ' + (payout ? payout + '%' : '?') + ' · ' + (s.candles?.m1?.length || 0) + ' bars';
 
-    const tf = s.settings?.tf === 'm5' ? 'm5' : 'm1';
-    const ms = tf === 'm5' ? 300000 : 60000;
+    // settings.hud.showChart was written by the schema and read by nobody.
+    if (el.spark) el.spark.style.display = s.settings?.hud?.showChart === false ? 'none' : '';
+
+    // The header prints the selected timeframe, so the bar and the countdown
+    // have to come from that same series — showing "m15" over 1-minute candles
+    // and a 60-second clock is a caption that contradicts the chart.
+    const TF_MS = { m1: 60_000, m5: 300_000, m15: 900_000 };
+    const tf = TF_MS[s.settings?.tf] ? s.settings.tf : 'm1';
+    const ms = TF_MS[tf];
     const cs = s.candles?.[tf] || [];
     const lastBar = cs[cs.length - 1];
     const rem = lastBar ? Math.max(0, Math.ceil((lastBar.t + ms - s.now) / 1000)) : 0;
@@ -352,7 +423,7 @@
     el.edge.textContent = j.decided ? `${j.edge >= 0 ? '+' : ''}${(j.edge * 100).toFixed(1)}pp` : '—';
     el.exp.textContent = j.decided ? `${j.expectancy >= 0 ? '+' : ''}${j.expectancy}` : '—';
 
-    drawSpark(cs.slice(-70));
+    if (s.settings?.hud?.showChart !== false) drawSpark(cs.slice(-70));
   }
 
   /* ------------------------------ loop ------------------------------- */
@@ -397,6 +468,7 @@
     }
     build();
     applySide();
+    setCompact(!!hud?.compact);
     poll();
   });
 

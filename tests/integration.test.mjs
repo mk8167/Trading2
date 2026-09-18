@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { install, notifications } from './chrome-stub.mjs';
 import { series } from './helpers.mjs';
-import { analyze } from '../src/background/strategy.js';
+import { analyze, breakEvenWinRate } from '../src/background/strategy.js';
 import { aggregate, TF_MS } from '../src/background/candles.js';
 
 // The stub must exist before the background modules are evaluated.
@@ -342,4 +342,60 @@ test('closing a trade with no price voids it instead of faking a tie', async () 
   assert.equal(r.result, 'void', 'must not invent a settlement price');
   assert.equal(r.pnl, 0);
   assert.equal(ledger.openOn('NOFEED').length, 0, 'and the pair is released');
+});
+
+/* ------------------- the numbers the user is shown -------------------- */
+
+test('the journal break-even comes from the payouts the trades were settled at', async () => {
+  const { createTrade, settleTrade } = ledger;
+  ledger.reset();
+  const t0ms = Date.now() - 3_600_000;
+  for (let i = 0; i < 10; i++) {
+    // Ten crypto-style trades at the broker's real 75% payout, six winners.
+    const t = createTrade({ sym: 'BTCUSD', dir: 'up', entry: 100, stake: 1, payout: 75, openedAt: t0ms + i * 60_000 });
+    settleTrade(t, i < 6 ? 101 : 99, t0ms + i * 60_000 + 60_000);
+    ledger.trades.push(t);
+  }
+
+  let r = await send('state.get', { sym: SYM });
+  const real = Math.round(breakEvenWinRate(75) * 10000) / 10000;
+  assert.equal(r.journal.breakEven, real, 'break-even must use the 75% the trades actually paid');
+  assert.notEqual(r.journal.breakEven, Math.round(breakEvenWinRate(86) * 10000) / 10000, 'not the global 86% default');
+  assert.equal(r.journal.avgPayout, 75);
+  assert.ok(r.journal.edge < 0.03, 'two points of the old edge were an artefact of the wrong payout');
+
+  // With nothing decided yet there is nothing to average, so the user's own
+  // setting is the honest fallback.
+  ledger.reset();
+  await send('settings.patch', { patch: { payout: 70 } });
+  r = await send('state.get', { sym: SYM });
+  assert.equal(r.journal.breakEven, Math.round(breakEvenWinRate(70) * 10000) / 10000);
+  await send('settings.patch', { patch: { payout: 86 } });
+});
+
+test('candidate pairs get a real verdict without being able to trade', async () => {
+  // Fresh bars: the ranker refuses to score a stale pair, and stale fixtures
+  // would hide whether the signal component was computed at all.
+  const t0 = (Math.floor(Date.now() / 60000) - 199) * 60;
+  for (const [sym, seed] of [['EURUSD_otc', 5], ['GBPUSD_otc', 9], ['AUDUSD_otc', 3]]) {
+    const cs = series({ n: 200, drift: 0.05, amp: 0.1, noise: 0.01, seed, t0: t0 * 1000 });
+    await send('feed.batch', { frames: cs.map((c, i) => frame(sym, t0 + i * 60, c.c)) });
+  }
+  await send('symbols.select', { sym: 'EURUSD_OTC' });
+  const s = await settings.load();
+
+  // Exactly what the heartbeat does for the pairs that are not on screen.
+  const before = ledger.trades.length;
+  for (const cand of ['GBPUSD_OTC', 'AUDUSD_OTC']) {
+    engine.evaluate(cand, s, { trade: false, preview: false, settle: false });
+  }
+  assert.equal(ledger.trades.length, before, 'a candidate can never open a paper trade');
+
+  const cached = engine.currentSignal('GBPUSD_OTC');
+  assert.ok(cached, 'a pair that is not selected still gets evaluated');
+  const r = await send('state.get', { sym: 'EURUSD_OTC' });
+  const row = [...(r.recommend.ranked || []), ...(r.recommend.ineligible || [])].find((x) => x.sym === 'GBPUSD_OTC');
+  assert.ok(row, 'the candidate appears in the ranking payload');
+  assert.equal(row.dir, cached.dir, 'the row reports the verdict the engine actually holds');
+  assert.ok(r.diag.candidates >= 2, 'candidate evaluations are counted in the Feed diagnostics');
 });
