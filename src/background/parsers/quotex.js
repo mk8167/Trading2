@@ -9,39 +9,42 @@
  * Protocol Lab.
  * ----------------------------------------------------------------*/
 
-export const SYMBOL_RE = /^[A-Z]{2,6}(?:\/[A-Z]{2,6})?(?:_OTC)?$/;
+import {
+  canonical,
+  isSymbol as isInstrument,
+  pretty as prettyName,
+  isOtc as otcOf,
+  classify,
+} from '../symbols.js';
+
 const SYMBOL_KEY_RE = /^(s|sym|symbol|name|asset|pair|instrument|ticker|id)$/i;
 const PRICE_KEY_RE = /^(p|px|price|rate|quote|last|close|bid|ask|c|value)$/i;
 const TIME_KEY_RE = /^(t|ts|time|timestamp|at|dt|date)$/i;
 const PAYOUT_KEY_RE = /^(payout|profit|percent|yield|rtng)$/i;
+/** A broker's own asset-type field, when the payload carries one. */
+const TYPE_KEY_RE = /^(type|asset_?type|class|category|kind|group)$/i;
+const OTC_KEY_RE = /^(otc|is_?otc|synthetic|demo)$/i;
 
 const MAX_FRAME = 262_144; // 256 KB — anything bigger is not a tick
 const MIN_TS = 946_684_800_000; // 2000-01-01
 const MAX_TS_SKEW = 365 * 24 * 3600 * 1000;
 
-export function isSymbol(s) {
-  if (typeof s !== 'string') return false;
-  const u = s.trim().toUpperCase();
-  return u.length > 3 && SYMBOL_RE.test(u);
-}
+/* Symbol identity lives in symbols.js — one authority, one canonical key.
+ * These re-exports keep the parser's public surface stable for callers. */
+export const isSymbol = isInstrument;
 
-export function normalizeSymbol(s) {
-  if (typeof s !== 'string') return '';
-  return s.trim().toUpperCase().replace(/\s+/g, '');
-}
+/** The canonical store key for a symbol (' eur/usd_otc ' -> 'EURUSD_OTC'). */
+export const normalizeSymbol = canonical;
 
 export function prettySymbol(sym) {
-  const u = normalizeSymbol(sym);
-  if (!u) return '—';
-  const otc = u.endsWith('_OTC');
-  const core = u.replace('_OTC', '').replace('/', '');
-  const slash = core.length === 6 ? `${core.slice(0, 3)}/${core.slice(3)}` : core;
-  return otc ? `${slash} OTC` : slash;
+  return prettyName(sym);
 }
 
 export function isOtc(sym) {
-  return normalizeSymbol(sym).endsWith('_OTC');
+  return otcOf(canonical(sym));
 }
+
+export { classify };
 
 /* --------------------------- frame decoding -------------------------- */
 
@@ -113,7 +116,7 @@ export function stripEnvelope(s) {
  * }}
  */
 export function extract(text) {
-  const result = { ticks: [], history: [], payouts: [], json: false, methods: [] };
+  const result = { ticks: [], history: [], payouts: [], meta: [], json: false, methods: [] };
   if (typeof text !== 'string' || !text.length || text.length > MAX_FRAME) return result;
 
   const body = stripEnvelope(text);
@@ -136,6 +139,7 @@ export function extract(text) {
   }
   if (result.history.length) result.methods.push('history');
   if (result.payouts.length) result.methods.push('payout');
+  if (result.meta.length) result.methods.push('asset-type');
   return result;
 }
 
@@ -185,12 +189,17 @@ function walk(node, inherited, res, depth = 0) {
   let price = null;
   let ts = null;
   let payout = null;
+  let type = null;
+  let otcHint = null;
 
   for (const key of Object.keys(node)) {
     const v = node[key];
     if (typeof v === 'string') {
       if (SYMBOL_KEY_RE.test(key) && isSymbol(v)) sym = normalizeSymbol(v);
       else if (!sym && isSymbol(v) && v.length > 4) sym = normalizeSymbol(v);
+      if (type == null && TYPE_KEY_RE.test(key) && v.trim()) type = v.trim();
+    } else if (typeof v === 'boolean') {
+      if (otcHint == null && OTC_KEY_RE.test(key)) otcHint = v;
     } else if (typeof v === 'number' && Number.isFinite(v)) {
       if (price == null && PRICE_KEY_RE.test(key)) price = v;
       if (ts == null && TIME_KEY_RE.test(key)) ts = v;
@@ -198,9 +207,23 @@ function walk(node, inherited, res, depth = 0) {
     }
   }
 
+  // The broker declaring what an instrument IS outranks anything we could
+  // infer from its name, so record it whenever both halves are present.
+  if (sym && (type || otcHint != null)) {
+    res.meta.push({ sym: normalizeSymbol(sym), type: type || null, otc: otcHint });
+  }
+
+  // A payout is recorded whether or not this node also carries a price.
+  // The broker's asset list sends {symbol, payout} with NO price, and this
+  // used to sit inside the price branch — so the real payout for every pair
+  // was discarded on exactly the frame that announced it, and the maths fell
+  // back to a global default.
+  if (sym && payout != null && payout > 0 && payout <= 200) {
+    res.payouts.push({ sym: normalizeSymbol(sym), payout });
+  }
+
   if (sym && price != null) {
     emitTick(res, sym, price, ts);
-    if (payout != null && payout > 0 && payout <= 200) res.payouts.push({ sym: normalizeSymbol(sym), payout });
     return;
   }
 
@@ -278,11 +301,22 @@ export function rowToCandle(row) {
 
 /* --------------------------- regex fallback -------------------------- */
 
-const RE_OBJ_TICK =
-  /([A-Za-z]{2,6}(?:\/[A-Za-z]{2,6})?(?:_otc)?)["']?\s*:\s*\{[^{}]{0,250}?"(?:price|rate|quote|last|close|bid|ask)"\s*:\s*([0-9]+(?:\.[0-9]+)?)/gi;
+/* Regex fallbacks. The symbol part allows digits and dashes because crypto
+ * names carry them (1000SHIBUSD, BTC-USD); the old `[A-Za-z]{2,6}` pattern
+ * rejected those outright, so their ticks vanished with no error anywhere.
+ * Junk that sneaks through is stopped downstream by isSymbol()'s
+ * letter-count guard, so widening here cannot invent a phantom instrument. */
+const SYM_PART = String.raw`[A-Za-z0-9]{2,10}(?:[-/.][A-Za-z0-9]{2,10})?(?:[\s_-]?otc)?`;
 
-const RE_ARR_TICK =
-  /['"]?([A-Za-z]{2,6}(?:\/[A-Za-z]{2,6})?(?:_otc)?)['"]?\s*[,:]\s*(1[0-9]{9}(?:\.[0-9]+)?)\s*[,:]\s*([0-9]+(?:\.[0-9]+)?)/gi;
+const RE_OBJ_TICK = new RegExp(
+  `(${SYM_PART})["']?\\s*:\\s*\\{[^{}]{0,250}?"(?:price|rate|quote|last|close|bid|ask)"\\s*:\\s*([0-9]+(?:\\.[0-9]+)?)`,
+  'gi'
+);
+
+const RE_ARR_TICK = new RegExp(
+  `['"]?(${SYM_PART})['"]?\\s*[,:]\\s*(1[0-9]{9}(?:\\.[0-9]+)?)\\s*[,:]\\s*([0-9]+(?:\\.[0-9]+)?)`,
+  'gi'
+);
 
 export function regexTicks(s, res) {
   let found = 0;

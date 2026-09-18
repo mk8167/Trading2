@@ -1,10 +1,10 @@
 {
   "manifest_version": 3,
-  "name": "Q-Sync Pro \u2014 Market Signal Studio",
+  "name": "Q-Sync Pro — Market Signal Studio",
   "short_name": "Q-Sync Pro",
-  "version": "6.0.0",
+  "version": "6.1.0",
   "minimum_chrome_version": "116",
-  "description": "Reads live market ticks straight from the page's own WebSocket, builds candles, scores multi-timeframe confluence signals and keeps a paper-trading journal with expectancy stats. Signal-only: it never clicks for you.",
+  "description": "Reads live market ticks straight from the page's own WebSocket, builds candles, classifies each instrument (forex / crypto / commodity / OTC), scores multi-timeframe confluence signals with class-aware volatility bands and market hours, recommends which pair to trade and why, and keeps a paper-trading journal with real expectancy maths. Signal-only: it never clicks for you.",
   "permissions": [
     "storage",
     "alarms",

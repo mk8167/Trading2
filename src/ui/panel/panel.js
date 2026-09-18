@@ -11,6 +11,7 @@ import { CandleChart } from '../chart.js';
 import { ema, adx } from '../../background/indicators.js';
 import { formatPrice, TF_MS } from '../../background/candles.js';
 import { breakEvenWinRate } from '../../background/strategy.js';
+import { pretty as prettySym } from '../../background/symbols.js';
 
 const $ = (id) => document.getElementById(id);
 const state = { data: null, tab: 'chart' };
@@ -305,10 +306,60 @@ function adxLast(cs) {
   return '—';
 }
 
+/* --------------------- "which pair should I trade" -------------------- */
+
+function renderRecommend(d) {
+  const box = $('recCard');
+  if (!box) return;
+  const rec = d.recommend || {};
+  const best = rec.best;
+  const rest = (rec.ranked || []).slice(1, 6);
+
+  if (!best) {
+    const why = (rec.ineligible || []).slice(0, 3).map((x) => `<div class="sub">· ${esc(x.pretty || x.sym)} — ${esc(x.reasons[0] || 'not tradeable')}</div>`).join('');
+    box.innerHTML = `
+      <div class="big" style="color:#f5c33b">⏳ NOTHING WORTH TRADING</div>
+      <div class="sub">No instrument currently passes the filters: live data, 40+ closed candles, an open market, and a payout above its break-even floor.</div>
+      ${why}
+    `;
+    return;
+  }
+
+  const row = (x, isBest) => `
+    <div class="sub" style="margin-top:${isBest ? 8 : 4}px;${isBest ? '' : 'opacity:.8'}">
+      ${isBest ? '<b>' : ''}${esc(x.pretty || x.sym)}${isBest ? '</b>' : ''}
+      <span style="opacity:.65">${esc(x.assetClass)}${x.otc ? ' · OTC' : ''}</span>
+      — <b>${x.score}</b>/100
+      ${x.dir === 'up' || x.dir === 'down' ? `<span style="color:${x.dir === 'up' ? '#2fbf71' : '#e04b5b'}">${x.dir.toUpperCase()} ${x.confidence}%</span>` : '<span style="opacity:.6">no signal</span>'}
+      · payout ${x.payout}% · be ${(x.breakEven * 100).toFixed(1)}%
+      ${x.historyN ? `· ${x.historyN} traded (${(x.historyWinRate * 100).toFixed(0)}% win, lb ${(x.historyLowerBound * 100).toFixed(0)}%)` : ''}
+    </div>`;
+
+  box.innerHTML = `
+    <div class="big" style="color:#4aa3ff">🎯 BEST PAIR RIGHT NOW</div>
+    ${row(best, true)}
+    <div class="sub" style="margin-top:6px;opacity:.85">${(best.reasons || []).map(esc).join('<br>')}</div>
+    ${rest.length ? `<h3 style="margin-top:10px">Also tradeable</h3>${rest.map((x) => row(x, false)).join('')}` : ''}
+    <div class="row-btns" style="margin-top:9px">
+      <button class="btn" id="recSwitch">Switch to ${esc(best.pretty || best.sym)}</button>
+    </div>
+  `;
+  const btn = $('recSwitch');
+  if (btn) btn.onclick = () => send('symbols.select', { sym: best.sym });
+}
+
 function renderSignalTab(d) {
+  renderRecommend(d);
   const sig = d.signal || { dir: 'wait', summary: 'no data' };
   const open = (d.openTrades || [])[0];
-  const payout = Number.isFinite(d.symbol?.payout) ? d.symbol.payout : d.settings?.payout || 86;
+  // The payout the engine actually used, not a guess: a wrong number here
+  // means a wrong break-even, which means a wrong judgement about the edge.
+  const payout = Number.isFinite(d.effectivePayout?.payout)
+    ? d.effectivePayout.payout
+    : Number.isFinite(d.symbol?.payout) ? d.symbol.payout : d.settings?.payout || 86;
+  const payoutNote = d.effectivePayout?.origin === 'live' ? 'live from broker'
+    : d.effectivePayout?.origin === 'class' ? `${d.assetClass || 'class'} typical`
+    : 'your default';
   const be = breakEvenWinRate(payout);
   $('sigCard').innerHTML = `
     <div class="big" style="color:${sig.dir === 'up' ? '#2fbf71' : sig.dir === 'down' ? '#e04b5b' : '#f5c33b'}">${DIR_LABEL[sig.dir] || '—'}</div>
@@ -318,8 +369,9 @@ function renderSignalTab(d) {
       votes ${sig.ctx?.upVotes ?? 0}▲ / ${sig.ctx?.downVotes ?? 0}▼
     </div>
     <div class="sub" style="margin-top:4px">
-      Break-even win rate at ${payout}% payout: <b>${(be * 100).toFixed(1)}%</b>
+      Break-even win rate at ${payout}% payout <span style="opacity:.65">(${esc(payoutNote)})</span>: <b>${(be * 100).toFixed(1)}%</b>
     </div>
+    ${d.marketOpen === false ? '<div class="sub" style="margin-top:6px;color:#e04b5b">⛔ Market closed — no signals are trustworthy right now</div>' : ''}
     ${open ? `<div class="sub" style="margin-top:7px;color:#f5c33b">🎫 open ${open.dir.toUpperCase()} @ ${formatPrice(open.entry)} · $${open.stake} · ${Math.max(0, Math.ceil((open.expiresAt - d.now) / 1000))}s left</div>` : ''}
   `;
 
@@ -485,14 +537,10 @@ function kv(pairs) {
     .join('');
 }
 
-function pretty(s) {
-  if (!s) return '—';
-  const u = String(s).toUpperCase();
-  const otc = u.endsWith('_OTC');
-  const core = u.replace('_OTC', '').replace('/', '');
-  const nice = core.length === 6 ? `${core.slice(0, 3)}/${core.slice(3)}` : core;
-  return nice + (otc ? ' OTC' : '');
-}
+/* One formatter for the whole extension: symbols.js. The local copy split a
+ * name only when it was exactly six characters, so every crypto pair
+ * (BTCUSDT, 1000SHIBUSDT) was printed as one unreadable blob. */
+const pretty = prettySym;
 
 function clock(t) {
   const d = new Date(t);

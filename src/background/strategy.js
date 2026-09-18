@@ -20,12 +20,21 @@ import {
   range,
 } from './patterns.js';
 import { closes } from './candles.js';
+import { volBand, closureText } from './symbols.js';
 
 export const DEFAULT_OPTS = {
   minScore: 3, // net points required before we show a direction
   minPayout: 70, // below this the maths is hopeless
   maxVolatility: 0.02, // ATR/price above this = too wild to trade
   minVolatility: 0.0002, // dead market = no movement to capture
+  // When the asset class is known, its own volatility band replaces the two
+  // numbers above: one shared band judged a crypto pair by forex standards
+  // (vetoing almost everything) and an OTC pair by crypto standards
+  // (vetoing almost nothing). Set useClassBands false to force the manual
+  // numbers regardless of class.
+  useClassBands: true,
+  // Refuse to signal on a market that is not actually trading.
+  respectMarketHours: true,
   useMtf: true, // let m5/m15 add weight
   usePatterns: true,
   useLevels: true,
@@ -73,8 +82,22 @@ export function analyze(data, opts = {}) {
   const vetoes = [];
   const signals = [];
 
-  if (vol > o.maxVolatility) vetoes.push(`Volatility ${pct(vol)} > ${pct(o.maxVolatility)} cap — news/spike risk`);
-  if (vol < o.minVolatility) vetoes.push(`Volatility ${pct(vol)} < ${pct(o.minVolatility)} floor — market is dead`);
+  const assetClass = data.assetClass || 'unknown';
+  const band = o.useClassBands && data.assetClass ? volBand(assetClass) : { min: o.minVolatility, max: o.maxVolatility };
+
+  // A frozen market produces no information, so a "signal" read off it is
+  // noise with a confident label on it. The caller decides openness (from
+  // the live clock, or per-bar when backtesting) and tells us the answer.
+  if (o.respectMarketHours && data.marketOpen === false) {
+    // The caller has already established closure (from the live clock, or
+    // from the bar timestamp when backtesting), so take its word for it and
+    // explain — re-checking the clock here would make the message depend on
+    // which day it happens to be.
+    vetoes.push(closureText(assetClass));
+  }
+
+  if (vol > band.max) vetoes.push(`Volatility ${pct(vol)} > ${pct(band.max)} cap for ${assetClass} — news/spike risk`);
+  if (vol < band.min) vetoes.push(`Volatility ${pct(vol)} < ${pct(band.min)} floor for ${assetClass} — market is dead`);
   if (o.minPayout && Number.isFinite(data.payout) && data.payout < o.minPayout) {
     vetoes.push(`Payout ${data.payout}% < ${o.minPayout}% break-even floor`);
   }
@@ -221,6 +244,9 @@ export function analyze(data, opts = {}) {
     price,
     atr: A,
     volatility: vol,
+    assetClass,
+    band,
+    marketOpen: data.marketOpen !== false,
     rsi: rNow,
     stochK: kNow,
     stochD: dNow,

@@ -239,3 +239,107 @@ test('TF_MS covers every timeframe the UI offers', () => {
   assert.deepEqual(Object.keys(TF_MS).sort(), ['m1', 'm15', 'm30', 'm5']);
   assert.equal(aggregate([{ t: 0, o: 1, h: 1, l: 1, c: 1 }], TF_MS.m30).length, 1);
 });
+
+/* ------------------- v6.1 wiring, end to end -------------------------- */
+
+test('state.get reports the asset class and the payout actually used', async () => {
+  await feedTrend({ n: 120, sym: 'EURUSD_otc', seed: 31 });
+  const r = await send('state.get', { sym: 'EUR/USD_OTC' });
+  assert.equal(r.ok, true);
+  assert.equal(r.selectedSym, 'EURUSD_OTC', 'a slash spelling resolves to the canonical key');
+  assert.equal(r.symbol.sym, 'EURUSD_OTC');
+  assert.equal(r.symbol.assetClass, 'synthetic');
+  assert.equal(r.symbol.otc, true);
+  assert.equal(r.symbol.pretty, 'EUR/USD OTC');
+  assert.ok(r.effectivePayout, 'the engine reports the payout it used');
+  assert.ok(['live', 'class', 'setting'].includes(r.effectivePayout.origin));
+  assert.ok(r.effectivePayout.payout > 0 && r.effectivePayout.payout <= 200);
+});
+
+test('state.get returns a recommendation with reasons', async () => {
+  await feedTrend({ n: 200, sym: 'EURUSD_otc', seed: 33 });
+  const r = await send('state.get', { sym: 'EURUSD_OTC' });
+  assert.ok(r.recommend, 'recommend payload present');
+  assert.ok(Array.isArray(r.recommend.ranked));
+  assert.ok(Array.isArray(r.recommend.ineligible));
+  const all = [...r.recommend.ranked, ...r.recommend.ineligible];
+  for (const x of all) {
+    assert.ok(Array.isArray(x.reasons) && x.reasons.length >= 1, `${x.sym} has no explanation`);
+  }
+  if (r.recommend.best) {
+    assert.equal(r.recommend.best.sym, r.recommend.ranked[0].sym);
+    assert.ok(r.recommend.best.score >= 0 && r.recommend.best.score <= 100);
+  }
+});
+
+test('symbols.select canonicalises what it stores', async () => {
+  await feedTrend({ n: 80, sym: 'GBPJPY_otc', seed: 34 });
+  const r = await send('symbols.select', { sym: 'gbp/jpy_otc' });
+  assert.equal(r.ok, true);
+  assert.equal(r.selectedSym, 'GBPJPY_OTC');
+  const s = await send('settings.get');
+  assert.equal(s.settings.selectedSym, 'GBPJPY_OTC', 'the stored setting is canonical too');
+  assert.equal(store.selected, 'GBPJPY_OTC', 'and the store protects exactly that key');
+  assert.ok(store.isProtected('GBP/JPY_otc'), 'protection matches any spelling');
+});
+
+test('the same pair fed under two spellings is one instrument in the list', async () => {
+  const before = store.symbols.size;
+  await send('feed.batch', { frames: series({ n: 60, seed: 35 }).map((c, i) => frame('NZDUSD_otc', T0 + 9000 + i * 60, c.c)) });
+  await send('feed.batch', { frames: series({ n: 60, seed: 35, start: 0.6 }).map((c, i) => frame('NZD/USD_otc', T0 + 9000 + i * 60, c.c)) });
+  const r = await send('symbols.list');
+  const hits = r.symbols.filter((x) => x.sym === 'NZDUSD_OTC');
+  assert.equal(hits.length, 1, 'exactly one entry, not one per spelling');
+  assert.ok(store.symbols.size <= before + 1, 'the second spelling created no extra symbol');
+});
+
+test('a payout sent before any tick still reaches the maths', async () => {
+  const fresh = 'PLATUSD_OTC';
+  await send('feed.frame', { frame: { text: JSON.stringify({ symbol: 'PLAT/USD_otc', payout: 79 }), binary: false } });
+  assert.equal(store.symbols.size >= 0, true);
+  await send('feed.batch', { frames: series({ n: 80, seed: 36 }).map((c, i) => frame('PLAT/USD_otc', T0 + 11000 + i * 60, c.c)) });
+  const st = store.getSymbol(fresh);
+  assert.ok(st, 'symbol exists');
+  assert.equal(st.payout, 79, 'the early payout was not dropped');
+  const r = await send('state.get', { sym: fresh });
+  assert.equal(r.effectivePayout.payout, 79);
+  assert.equal(r.effectivePayout.origin, 'live');
+});
+
+test('a broker-declared asset type flows through to the signal context', async () => {
+  await send('feed.frame', { frame: { text: JSON.stringify({ symbol: 'ZZZUSD', type: 'crypto', price: 12.5, t: T0 + 12000 }), binary: false } });
+  assert.equal(store.getSymbol('ZZZUSD').assetClass, 'crypto');
+  await send('feed.batch', { frames: series({ n: 80, seed: 37, start: 12 }).map((c, i) => frame('ZZZUSD', T0 + 12000 + i * 60, c.c)) });
+  const r = await send('state.get', { sym: 'ZZZUSD' });
+  assert.equal(r.assetClass, 'crypto');
+  assert.equal(r.signal?.ctx?.assetClass, 'crypto', 'the strategy was told the class');
+  assert.ok(r.signal?.ctx?.band, 'and used that class band');
+});
+
+test('the catalog never lists one instrument twice', async () => {
+  await feedTrend({ n: 60, sym: 'EURUSD_otc', seed: 38 });
+  const r = await send('state.get', { sym: 'EURUSD_OTC' });
+  const all = [...r.catalog.quotex, ...r.catalog.crypto, ...r.catalog.fx];
+  assert.equal(new Set(all).size, all.length, `duplicate entries in catalog: ${all.join(', ')}`);
+  for (const k of all) assert.ok(!k.includes('/'), `catalog keys must be canonical, got ${k}`);
+});
+
+test('the journal breakdown includes a per-asset-class view', async () => {
+  await feedTrend({ n: 120, sym: 'EURUSD_otc', seed: 39 });
+  const r = await send('state.get', { sym: 'EURUSD_OTC' });
+  assert.ok(r.journal.breakdown.assetClass !== undefined, 'byClass breakdown present');
+  assert.ok(Array.isArray(r.journal.breakdown.assetClass));
+});
+
+test('closing a trade with no price voids it instead of faking a tie', async () => {
+  ledger.reset();
+  const t = ledger.openTrade({
+    sym: 'NOFEED', dir: 'up', entry: 1.1, stake: 1, payout: 86, tf: 'm1',
+    expiryMinutes: 5, signals: [], score: 5, confidence: 80, source: 'quotex',
+  });
+  const r = await send('journal.trade.close', { id: t.id }); // no price supplied
+  assert.equal(r.ok, true);
+  assert.equal(r.result, 'void', 'must not invent a settlement price');
+  assert.equal(r.pnl, 0);
+  assert.equal(ledger.openOn('NOFEED').length, 0, 'and the pair is released');
+});

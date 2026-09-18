@@ -11,6 +11,7 @@
 import { analyze, gate, DEFAULT_OPTS } from './strategy.js';
 import { aggregate, TF_MS, bucketOf } from './candles.js';
 import { createTrade, settleTrade, stats, maxDrawdown, streaks } from './journal.js';
+import { marketOpen } from './symbols.js';
 
 export const BACKTEST_DEFAULTS = {
   warmup: 60, // bars consumed before the first evaluation
@@ -20,6 +21,12 @@ export const BACKTEST_DEFAULTS = {
   tf: 'm1',
   maxTrades: 2000,
   useMtf: true,
+  // When set, the replay uses this class's volatility band and skips bars
+  // whose market was closed — otherwise a backtest over a forex pair counts
+  // trades taken against a chart that was frozen for the weekend, and reports
+  // an edge that could never have been traded.
+  assetClass: null,
+  respectMarketHours: true,
 };
 
 /**
@@ -36,7 +43,7 @@ export function runBacktest(m1, cfg = {}) {
   const tfMs = TF_MS[o.tf] || TF_MS.m1;
   const barsPerTrade = o.expiryBars;
   const trades = [];
-  const skipped = { veto: 0, gate: 0, none: 0, warmup: 0 };
+  const skipped = { veto: 0, gate: 0, none: 0, warmup: 0, closed: 0 };
   const equity = [];
   let cash = 0;
   const opts = { ...DEFAULT_OPTS, ...(o.strategy || {}), useMtf: o.useMtf };
@@ -65,6 +72,13 @@ export function runBacktest(m1, cfg = {}) {
     const bar = src[i];
     const slice = src.slice(0, i + 1);
     const now = bar.t + tfMs; // decision happens at the close of `bar`
+
+    // Per-bar, not per-run: a replay can span a weekend.
+    if (o.respectMarketHours && o.assetClass && !marketOpen(o.assetClass, now)) {
+      skipped.closed++;
+      continue;
+    }
+
     const sig = analyze(
       {
         m1: slice,
@@ -72,6 +86,9 @@ export function runBacktest(m1, cfg = {}) {
         m15: o.useMtf ? upto(m15All, bar.t) : [],
         price: bar.c,
         payout: o.payout,
+        assetClass: o.assetClass || undefined,
+        marketOpen: o.assetClass ? marketOpen(o.assetClass, now) : undefined,
+        now,
       },
       opts
     );
@@ -114,6 +131,7 @@ export function runBacktest(m1, cfg = {}) {
         confidence: sig.confidence,
         openedAt: now,
         source: 'backtest',
+        assetClass: o.assetClass || null,
       }),
       exitClose,
       src[exitIdx].t + tfMs

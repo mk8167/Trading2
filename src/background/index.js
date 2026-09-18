@@ -32,8 +32,12 @@ async function boot() {
   last.boot = Date.now();
 
   const s = await settings.load();
+  // Protect the watched pair BEFORE the snapshot is restored, so nothing can
+  // evict it while state is being rebuilt.
+  store.setSelected(s.selectedSym);
   await restoreSnapshot();
   await ledger.load();
+  store.protectOpen(ledger.openSymbols());
 
   try {
     await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: false });
@@ -89,7 +93,14 @@ async function tick() {
   const now = Date.now();
   const s = settings.peek();
 
-  const sym = s.selectedSym || store.listSymbols()[0]?.sym || null;
+  // Refresh the protection set every beat: the watched pair plus anything
+  // holding an unsettled trade. Without this, eviction and the stale-prune
+  // could delete a symbol's candle history out from under an open trade,
+  // which also wedged that pair permanently (an open trade blocks new ones).
+  store.setSelected(s.selectedSym);
+  store.protectOpen(ledger.openSymbols());
+
+  const sym = store.selected || store.listSymbols()[0]?.sym || null;
   if (sym) {
     try {
       engine.evaluate(sym, s);

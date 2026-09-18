@@ -7,7 +7,7 @@
 
 import { breakEvenWinRate } from './strategy.js';
 
-export function createTrade({ sym, dir, entry, stake, payout, tf = 'm1', expiryMinutes = 1, signals = [], score = 0, confidence = 0, openedAt = Date.now(), source = 'quotex', id }) {
+export function createTrade({ sym, dir, entry, stake, payout, tf = 'm1', expiryMinutes = 1, signals = [], score = 0, confidence = 0, openedAt = Date.now(), source = 'quotex', assetClass = null, otc = false, id }) {
   return {
     id: id || `t_${openedAt}_${Math.random().toString(36).slice(2, 8)}`,
     sym,
@@ -27,6 +27,8 @@ export function createTrade({ sym, dir, entry, stake, payout, tf = 'm1', expiryM
     result: null, // 'win' | 'loss' | 'tie'
     pnl: 0,
     source,
+    assetClass,
+    otc,
   };
 }
 
@@ -57,9 +59,44 @@ export function openExposure(trades) {
 
 /* ------------------------------ stats -------------------------------- */
 
+/**
+ * True for an outcome that actually decided something.
+ *
+ * 'tie' returns the stake and 'void' means we never obtained a real
+ * settlement price, so neither may enter a win rate, a streak, or a
+ * per-setup breakdown — doing so silently biases the numbers the risk gate
+ * and the journal both depend on.
+ */
+export function isDecided(t) {
+  return !!t && (t.result === 'win' || t.result === 'loss');
+}
+
+/**
+ * Mark a trade un-settleable rather than leaving it open forever.
+ *
+ * An open trade blocks every future trade on its symbol, so a pair whose
+ * feed disappears would otherwise wedge permanently. Voiding releases the
+ * block without inventing a win or a loss.
+ */
+export function voidTrade(trade, reason = 'no settlement price available', at = Date.now()) {
+  if (!trade || trade.result) return trade;
+  trade.result = 'void';
+  trade.pnl = 0;
+  trade.exit = null;
+  trade.settledAt = at;
+  trade.voidReason = reason;
+  return trade;
+}
+
 export function stats(trades, { payout } = {}) {
   const settled = (trades || []).filter((t) => t.result);
-  const decided = settled.filter((t) => t.result !== 'tie');
+  // Only wins and losses are "decided". A tie returns the stake, and a void
+  // is a trade that could never be settled against a real price — counting
+  // either as a decided outcome would skew the win rate that the risk gate
+  // is built on.
+  const decided = settled.filter((t) => t.result === 'win' || t.result === 'loss');
+  const ties = settled.filter((t) => t.result === 'tie');
+  const voids = settled.filter((t) => t.result === 'void');
   const wins = decided.filter((t) => t.result === 'win');
   const losses = decided.filter((t) => t.result === 'loss');
   const grossWin = wins.reduce((s, t) => s + t.pnl, 0);
@@ -76,7 +113,8 @@ export function stats(trades, { payout } = {}) {
     decided: decided.length,
     wins: wins.length,
     losses: losses.length,
-    ties: settled.length - decided.length,
+    ties: ties.length,
+    voids: voids.length,
     open: (trades || []).length - settled.length,
     winRate: round(winRate, 4),
     breakEven: round(be, 4),
@@ -103,7 +141,7 @@ const avgPayout = (list) => (list && list.length ? list.reduce((s, t) => s + (t.
 export function groupStats(trades, keyFn) {
   const map = new Map();
   for (const t of trades || []) {
-    if (!t.result || t.result === 'tie') continue;
+    if (!isDecided(t)) continue;
     const k = keyFn(t);
     if (!k) continue;
     if (!map.has(k)) map.set(k, []);
@@ -118,6 +156,9 @@ export const bySetup = (trades) => groupStats(trades, (t) => (t.signals && t.sig
 export const bySymbol = (trades) => groupStats(trades, (t) => t.sym);
 export const byTimeframe = (trades) => groupStats(trades, (t) => t.tf);
 export const byDirection = (trades) => groupStats(trades, (t) => t.dir);
+/** Per asset class — the edge on a synthesised OTC feed is not the edge on
+ *  a real crypto market, and averaging them hides which is which. */
+export const byClass = (trades) => groupStats(trades, (t) => t.assetClass || 'unknown');
 export const byHour = (trades) =>
   groupStats(trades, (t) => `${String(new Date(t.openedAt).getHours()).padStart(2, '0')}:00`);
 
@@ -125,7 +166,7 @@ export const byHour = (trades) =>
 export function equityCurve(trades, start = 0) {
   let eq = start;
   const out = [{ t: trades?.[0]?.openedAt ?? Date.now(), equity: eq }];
-  for (const t of (trades || []).filter((x) => x.result)) {
+  for (const t of (trades || []).filter(isDecided)) {
     eq += t.pnl;
     out.push({ t: t.settledAt || t.expiresAt, equity: round(eq, 2) });
   }
@@ -137,7 +178,7 @@ export function maxDrawdown(trades, start = 0) {
   let eq = start;
   let peak = start;
   let mdd = 0;
-  for (const t of (trades || []).filter((x) => x.result)) {
+  for (const t of (trades || []).filter(isDecided)) {
     eq += t.pnl;
     if (eq > peak) peak = eq;
     if (peak - eq > mdd) mdd = peak - eq;
@@ -150,7 +191,7 @@ export function streaks(trades) {
   let bestLoss = 0;
   let cw = 0;
   let cl = 0;
-  for (const t of (trades || []).filter((x) => x.result && x.result !== 'tie')) {
+  for (const t of (trades || []).filter(isDecided)) {
     if (t.result === 'win') {
       cw++;
       cl = 0;
@@ -166,7 +207,7 @@ export function streaks(trades) {
 
 /** Rolling win rate over `window` trades — drives the live risk gate. */
 export function rollingWinRate(trades, window = 20) {
-  const d = (trades || []).filter((t) => t.result && t.result !== 'tie').slice(-window);
+  const d = (trades || []).filter(isDecided).slice(-window);
   if (!d.length) return null;
   return d.filter((t) => t.result === 'win').length / d.length;
 }
@@ -174,7 +215,7 @@ export function rollingWinRate(trades, window = 20) {
 /* ------------------------------- CSV --------------------------------- */
 
 const CSV_COLS = [
-  'id', 'openedAt', 'openedAtIso', 'sym', 'source', 'tf', 'dir', 'entry', 'exit',
+  'id', 'openedAt', 'openedAtIso', 'sym', 'source', 'assetClass', 'tf', 'dir', 'entry', 'exit',
   'stake', 'payout', 'result', 'pnl', 'score', 'confidence', 'signals',
 ];
 

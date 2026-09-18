@@ -147,3 +147,69 @@ test('streak counters', () => {
   assert.equal(winStreak([t('loss'), t('win'), t('win')]), 2);
   assert.equal(lossStreak([]), 0);
 });
+
+/* ------------------ asset-class awareness (v6.1) --------------------- */
+
+test('a closed market is refused, whatever the chart looks like', () => {
+  const data = { ...withTf(series({ n: 240, drift: 0.05, amp: 0.1, noise: 0.01, seed: 5 })), assetClass: 'forex', marketOpen: false };
+  const r = analyze(data);
+  assert.equal(r.dir, 'veto');
+  assert.ok(r.vetoes.some((v) => /closed for the weekend/i.test(v)), r.vetoes.join('|'));
+});
+
+test('the same chart IS tradeable when the market is open', () => {
+  const open = analyze({ ...withTf(series({ n: 240, drift: 0.05, amp: 0.1, noise: 0.01, seed: 5 })), assetClass: 'forex', marketOpen: true });
+  assert.notEqual(open.dir, 'veto');
+});
+
+test('crypto and OTC are never refused for weekend closure', () => {
+  const m1 = series({ n: 240, drift: 0.05, amp: 0.1, noise: 0.01, seed: 5 });
+  for (const cls of ['crypto', 'synthetic']) {
+    const r = analyze({ ...withTf(m1), assetClass: cls, marketOpen: true });
+    assert.ok(!r.vetoes.some((v) => /weekend/i.test(v)), `${cls} should not be weekend-vetoed`);
+  }
+});
+
+test('respectMarketHours:false disables the closure veto', () => {
+  const r = analyze({ ...withTf(series({ n: 240, drift: 0.05, amp: 0.1, noise: 0.01, seed: 5 })), assetClass: 'forex', marketOpen: false }, { respectMarketHours: false });
+  assert.ok(!r.vetoes.some((v) => /weekend/i.test(v)));
+});
+
+test('an explicit volatility override still wins over the class band', () => {
+  // The class band for crypto is wide, but an explicit 0.001 cap must apply.
+  const r = analyze({ ...withTf(series({ n: 240, drift: 0.05, amp: 4, noise: 1.5, seed: 9 })), assetClass: 'crypto' }, { maxVolatility: 0.001, useClassBands: false });
+  assert.equal(r.dir, 'veto');
+  assert.ok(r.vetoes.some((v) => /Volatility/.test(v)));
+});
+
+test('the veto message names the class whose band was applied', () => {
+  const r = analyze({ ...withTf(series({ n: 240, drift: 0.05, amp: 4, noise: 1.5, seed: 9 })), assetClass: 'crypto' }, { useClassBands: true });
+  const v = r.vetoes.find((x) => /Volatility/.test(x));
+  if (v) assert.match(v, /crypto/);
+});
+
+test('useClassBands:false falls back to the configured numbers', () => {
+  const m1 = series({ n: 240, drift: 0.05, amp: 0.1, noise: 0.01, seed: 5 });
+  const auto = analyze({ ...withTf(m1), assetClass: 'crypto' }, { useClassBands: true });
+  const manual = analyze({ ...withTf(m1), assetClass: 'crypto' }, { useClassBands: false, maxVolatility: 0.0001 });
+  assert.equal(manual.dir, 'veto', 'an absurdly tight manual cap must veto');
+  assert.notEqual(auto.dir, undefined);
+});
+
+test('ctx reports the class and the band actually used', () => {
+  const r = analyze({ ...withTf(series({ n: 240, drift: 0.05, amp: 0.1, noise: 0.01, seed: 5 })), assetClass: 'crypto', marketOpen: true });
+  assert.equal(r.ctx.assetClass, 'crypto');
+  assert.equal(r.ctx.band.max, 0.03);
+  assert.equal(r.ctx.marketOpen, true);
+});
+
+test('no asset class at all behaves exactly as it did before', () => {
+  // Backwards compatibility: an unknown instrument uses the legacy numbers,
+  // so upgrading cannot silently change signals on data we cannot classify.
+  const m1 = series({ n: 240, drift: 0.05, amp: 0.1, noise: 0.01, seed: 5 });
+  const withClass = analyze({ ...withTf(m1), assetClass: 'unknown' });
+  const without = analyze(withTf(m1));
+  assert.equal(withClass.dir, without.dir);
+  assert.equal(withClass.score, without.score);
+  assert.deepEqual(withClass.ctx.band, { min: 0.0002, max: 0.02 });
+});

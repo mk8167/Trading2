@@ -17,7 +17,7 @@ const NOISE = /^(\d{1,3}|2probe|3|0\{.*)$/;
  * @returns {{ticks:number, history:number, payouts:number, samples:number}}
  */
 export function handleFrame(frame) {
-  const out = { ticks: 0, history: 0, payouts: 0, samples: 0 };
+  const out = { ticks: 0, history: 0, payouts: 0, meta: 0, samples: 0 };
   store.diag.frames++;
   try {
     let text = '';
@@ -43,8 +43,14 @@ export function handleFrame(frame) {
       store.setPayout(p.sym, p.payout);
       out.payouts++;
     }
+    // The broker's own asset-type declaration outranks anything inferred
+    // from a name, and it usually arrives before the first tick.
+    for (const m of r.meta || []) {
+      store.setMeta(m.sym, { type: m.type, otc: m.otc });
+      out.meta++;
+    }
 
-    if (!out.ticks && !out.history && !out.payouts) {
+    if (!out.ticks && !out.history && !out.payouts && !out.meta) {
       // Only keep samples that could plausibly carry market data.
       if (trimmed.length > 24 && /[0-9]/.test(trimmed)) {
         const s = sampleOf(trimmed);
@@ -66,10 +72,14 @@ export function handleFrame(frame) {
 export function handleBatch(frames) {
   let ticks = 0;
   let history = 0;
+  let payouts = 0;
+  let meta = 0;
   for (const f of frames || []) {
     const r = handleFrame(f);
     ticks += r.ticks;
     history += r.history;
+    payouts += r.payouts;
+    meta += r.meta;
   }
-  return { ticks, history };
+  return { ticks, history, payouts, meta };
 }

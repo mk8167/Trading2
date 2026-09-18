@@ -1,16 +1,8 @@
 import { formatPrice, TF_MS } from '../../background/candles.js';
+import { pretty } from '../../background/symbols.js';
 
 const $ = (id) => document.getElementById(id);
 const LABEL = { up: '▲ CALL / UP', down: '▼ PUT / DOWN', veto: '⛔ BLOCKED', none: '— NO EDGE', wait: '⏳ WARMING UP' };
-
-const pretty = (s) => {
-  if (!s) return '—';
-  const u = String(s).toUpperCase();
-  const otc = u.endsWith('_OTC');
-  const core = u.replace('_OTC', '').replace('/', '');
-  const nice = core.length === 6 ? `${core.slice(0, 3)}/${core.slice(3)}` : core;
-  return nice + (otc ? ' OTC' : '');
-};
 
 const send = (cmd, payload = {}) =>
   new Promise((resolve) => {

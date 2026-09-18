@@ -222,12 +222,27 @@
     const a = Math.abs(p);
     return p.toFixed(a >= 1000 ? 2 : a >= 100 ? 3 : a >= 10 ? 4 : 5);
   };
+  /* Mirrors symbols.js. This file runs as a classic content script, not a
+   * module, so it cannot import the shared formatter; the quote table has to
+   * be duplicated here. Longest match first, so BTCUSDT splits as
+   * BTC/USDT and not BTCU/SDT, and names of any length work instead of only
+   * the six-character forex case. */
+  const QUOTES = ['USDT', 'USDC', 'BUSD', 'TUSD', 'FDUSD', 'DAI', 'USD', 'EUR', 'GBP',
+    'JPY', 'CHF', 'CAD', 'AUD', 'NZD', 'SEK', 'NOK', 'TRY', 'ZAR', 'MXN', 'SGD', 'HKD',
+    'PLN', 'BTC', 'ETH', 'BNB', 'SOL', 'XRP'];
   const pretty = (s) => {
     if (!s) return '—';
-    const u = String(s).toUpperCase();
+    const raw = String(s).trim();
+    const u = raw.toUpperCase().replace(/[\s/\-.]/g, '');
     const otc = u.endsWith('_OTC');
-    const core = u.replace('_OTC', '').replace('/', '');
-    const nice = core.length === 6 ? core.slice(0, 3) + '/' + core.slice(3) : core;
+    const core = otc ? u.slice(0, -4) : u;
+    let nice = core;
+    for (const q of QUOTES) {
+      if (core.length > q.length + 1 && core.endsWith(q)) {
+        nice = core.slice(0, -q.length) + '/' + q;
+        break;
+      }
+    }
     return nice + (otc ? ' · OTC' : '');
   };
 

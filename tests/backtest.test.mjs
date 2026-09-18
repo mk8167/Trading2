@@ -116,3 +116,49 @@ test('the backtester is deterministic', () => {
   assert.equal(a.stats.net, b.stats.net);
   assert.deepEqual(a.trades.map((t) => t.dir), b.trades.map((t) => t.dir));
 });
+
+/* ------------------- market hours in a replay (v6.1) ------------------ */
+
+// Friday 20:00 UTC 2026-09-18; 600 one-minute bars runs to Saturday 06:00,
+// so the replay crosses the 22:00 UTC forex close.
+const FRI_20 = Date.UTC(2026, 8, 18, 20, 0, 0);
+const weekendSeries = () => series({ n: 600, drift: 0.04, amp: 0.12, noise: 0.02, seed: 21, t0: FRI_20 });
+
+test('a forex replay skips bars whose market was closed', () => {
+  const r = runBacktest(weekendSeries(), { payout: 86, warmup: 60, assetClass: 'forex' });
+  assert.equal(r.ok, true);
+  assert.ok(r.skipped.closed > 0, `expected weekend bars to be skipped, got ${JSON.stringify(r.skipped)}`);
+});
+
+test('the same replay as crypto skips nothing — crypto never closes', () => {
+  const r = runBacktest(weekendSeries(), { payout: 86, warmup: 60, assetClass: 'crypto' });
+  assert.equal(r.ok, true);
+  assert.equal(r.skipped.closed, 0);
+});
+
+test('skipping the weekend changes the result — proving it was not cosmetic', () => {
+  const honest = runBacktest(weekendSeries(), { payout: 86, warmup: 60, assetClass: 'forex' });
+  const naive = runBacktest(weekendSeries(), { payout: 86, warmup: 60, assetClass: 'forex', respectMarketHours: false });
+  assert.equal(naive.skipped.closed, 0);
+  assert.ok(honest.skipped.closed > 0);
+  const honestBars = honest.skipped.closed + honest.trades.length + honest.skipped.veto + honest.skipped.gate + honest.skipped.none + honest.skipped.warmup;
+  const naiveBars = naive.trades.length + naive.skipped.veto + naive.skipped.gate + naive.skipped.none + naive.skipped.warmup;
+  assert.equal(honestBars, naiveBars, 'every bar is accounted for exactly once either way');
+});
+
+test('without an asset class the replay behaves exactly as it did before', () => {
+  const r = runBacktest(weekendSeries(), { payout: 86, warmup: 60 });
+  assert.equal(r.skipped.closed, 0, 'no class means no closure judgement');
+});
+
+test('every bar is still accounted for exactly once, closure included', () => {
+  const r = runBacktest(weekendSeries(), { payout: 86, warmup: 60, assetClass: 'forex' });
+  const accounted = r.skipped.veto + r.skipped.gate + r.skipped.none + r.skipped.warmup + r.skipped.closed + r.trades.length;
+  assert.equal(accounted, r.evaluated, `${accounted} accounted vs ${r.evaluated} evaluated`);
+});
+
+test('backtest trades record the asset class they were run under', () => {
+  const r = runBacktest(series({ n: 600, drift: 0.04, amp: 0.12, noise: 0.02, seed: 21 }), { payout: 86, warmup: 60, assetClass: 'crypto' });
+  assert.ok(r.trades.length > 0);
+  for (const t of r.trades) assert.equal(t.assetClass, 'crypto');
+});

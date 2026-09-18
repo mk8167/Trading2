@@ -11,6 +11,13 @@ import * as store from './store.js';
 import * as ledger from './ledger.js';
 import { analyze, gate, breakEvenWinRate } from './strategy.js';
 import { lastOf, TF_MS, bucketOf } from './candles.js';
+import { marketOpen, pretty as prettyName } from './symbols.js';
+
+/** Last known price for any symbol, or null when we have none. */
+function lastPrice(sym) {
+  const st = store.getSymbol(sym);
+  return st && Number.isFinite(st.price) && st.price > 0 ? st.price : null;
+}
 
 const evaluatedAt = new Map(); // sym -> open time of the last bar we acted on
 const cache = new Map(); // sym -> {barT, signal}
@@ -37,20 +44,37 @@ export function evaluate(sym, settings) {
   store.refreshDerived(sym);
   const m1 = s.tf.m1;
   const price = Number.isFinite(s.price) ? s.price : lastOf(m1)?.c;
-  const payout = Number.isFinite(s.payout) ? s.payout : settings.payout;
+  // Class-aware payout: the live figure from the broker when we have it,
+  // otherwise what is typical for this asset class — not one global 86%
+  // applied to crypto and forex alike, which made the break-even number on
+  // screen wrong for every pair that was not forex.
+  const resolved = store.effectivePayout(sym, settings.payout);
+  const payout = resolved.payout;
+  const now = Date.now();
 
-  // Settle anything that expired while we were asleep.
-  const settled = ledger.settleDue(sym, price);
+  // Settle everything that expired, on this symbol AND every other one.
+  // Settling only `sym` stranded trades whenever the user switched pairs,
+  // and a stranded trade blocks that pair from ever trading again.
+  const settled = ledger.settleAllDue(lastPrice, now);
+
+  const assetClass = s.assetClass || 'unknown';
+  const data = {
+    m1: s.tf.m1,
+    m5: s.tf.m5,
+    m15: s.tf.m15,
+    price,
+    payout,
+    assetClass,
+    marketOpen: marketOpen(assetClass, now),
+    now,
+  };
 
   const barT = m1.length > 1 ? m1[m1.length - 2].t : 0; // last CLOSED bar
   let newBar = false;
   let signal = cache.get(sym);
 
   if (!signal || signal.barT !== barT || !barT) {
-    const computed = analyze(
-      { m1: s.tf.m1, m5: s.tf.m5, m15: s.tf.m15, price, payout },
-      settings.strategy
-    );
+    const computed = analyze(data, settings.strategy);
     signal = { barT, signal: computed };
     cache.set(sym, signal);
     newBar = barT !== 0 && evaluatedAt.get(sym) !== undefined && evaluatedAt.get(sym) !== barT;
@@ -60,7 +84,7 @@ export function evaluate(sym, settings) {
   const sig = signal.signal;
 
   if (newBar && sig && (sig.dir === 'up' || sig.dir === 'down')) {
-    maybeTrade(sym, sig, { settings, price, payout, source: s.source });
+    maybeTrade(sym, sig, { settings, price, payout, source: s.source, assetClass, otc: !!s.otc });
   } else if (newBar && sig?.dir === 'veto') {
     ledger.logEvent('veto', `${sym} blocked — ${sig.vetoes[0]}`);
   }
@@ -73,16 +97,27 @@ export function evaluate(sym, settings) {
   const secondsToClose = formingOpen ? Math.max(0, Math.ceil((formingOpen + tfMs - Date.now()) / 1000)) : 0;
   let preview = null;
   if (m1.length >= 40) {
-    preview = analyze(
-      { m1: s.tf.m1, m5: s.tf.m5, m15: s.tf.m15, price, payout },
-      { ...settings.strategy, preview: true }
-    );
+    preview = analyze(data, { ...settings.strategy, preview: true });
   }
 
-  return { signal: sig, preview, secondsToClose, tf, open: ledger.openOn(sym), settled, newBar };
+  return {
+    signal: sig,
+    preview,
+    secondsToClose,
+    tf,
+    open: ledger.openOn(sym),
+    settled,
+    newBar,
+    // Report the numbers the decision was actually made with, so the UI can
+    // never show a break-even figure the engine did not use.
+    payout,
+    payoutOrigin: resolved.origin,
+    assetClass,
+    marketOpen: data.marketOpen,
+  };
 }
 
-function maybeTrade(sym, sig, { settings, price, payout, source }) {
+function maybeTrade(sym, sig, { settings, price, payout, source, assetClass, otc }) {
   if (!settings.autoPaperTrade) return;
   if (ledger.openOn(sym).length) return;
   if (!Number.isFinite(price) || price <= 0) return;
@@ -112,6 +147,8 @@ function maybeTrade(sym, sig, { settings, price, payout, source }) {
     score: sig.score,
     confidence: sig.confidence,
     source,
+    assetClass,
+    otc,
   });
 
   if (settings.alerts?.desktop && sig.confidence >= (settings.alerts.minConfidence ?? 0)) {
@@ -124,7 +161,7 @@ function notify(sig, sym, price, payout) {
     chrome.notifications.create(`qsync-${Date.now()}`, {
       type: 'basic',
       iconUrl: chrome.runtime.getURL('icons/icon128.png'),
-      title: `Q-Sync · ${sig.dir.toUpperCase()} ${sym}`,
+      title: `Q-Sync · ${sig.dir.toUpperCase()} ${prettyName(sym)}`,
       message: `${sig.summary}\nEntry ${price} · payout ${payout}% · break-even ${(breakEvenWinRate(payout) * 100).toFixed(1)}%`,
       priority: 2,
     });

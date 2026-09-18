@@ -1,4 +1,4 @@
-# ⚡ Q-Sync Pro — Market Signal Studio (v6.0.0)
+# ⚡ Q-Sync Pro — Market Signal Studio (v6.1.0)
 
 A Chrome MV3 extension that reads live market ticks straight from a broker page's own
 WebSocket, builds candles, scores multi-timeframe confluence signals, and keeps a
@@ -44,7 +44,40 @@ with `chrome.scripting.registerContentScripts()`. Reload the tab afterwards.
 | **Backtester** | none | Replays the identical strategy with next-bar-open entry (no look-ahead) |
 | **Chart** | 60 hand-drawn bars, blurry on HiDPI | DPR-aware canvas, EMA overlays, S/R lines, trade markers, crosshair, wheel zoom, drag pan |
 | **UI** | One floating div on every page | Floating HUD (shadow DOM) + side-panel dashboard + popup + options page |
-| **Tests** | none | **119 automated tests**, `npm test` |
+| **Tests** | none | **231 automated tests**, `npm test` |
+
+---
+
+## What changed from v6.0.0 → v6.1.0
+
+Every item below was a bug that produced **no error and no visible symptom** — it just made
+a number on screen quietly wrong.
+
+| # | Problem | Fix |
+|---|---|---|
+| 1 | `setSelected()` was defined but **never called from anywhere**, so `store.selected` was permanently `null`. The guard `s.sym !== selected` in `pruneStale()` therefore protected nothing, and `evictOldest()` had no guard at all. The pair you were watching could be deleted along with its entire candle history — routinely, every weekend for a forex pair. | `store.setSelected()` is now called from boot, the heartbeat, `symbols.select`, `settings.patch` and `state.get`. Protection covers the watched pair **and** every pair holding an unsettled trade. Eviction prefers symbols with no candles over ones with real history, and `serialize()` always keeps protected symbols inside the snapshot limit. |
+| 2 | `ledger.settleDue(sym)` only ran for the single symbol the heartbeat evaluated. Switch pairs after a trade opens and that trade **never settles** — which permanently blocks the pair, because `maybeTrade()` refuses to trade while `openOn(sym)` is non-empty. Unsettled trades were also missing from every statistic. | New `ledger.settleAllDue(priceOf)` settles across all symbols in one pass. A trade whose price feed is gone waits a 5-minute grace period, then is **voided** — never faked. Voids and ties are excluded from win rate, streaks and rolling average via a shared `isDecided()` predicate. |
+| 3 | Store keys were the raw symbol string, so one instrument could live under `EURUSD_OTC` **and** `USD/CAD_OTC`-style slash spellings — splitting its candle history in two and computing every indicator from half the data. The Binance/Yahoo fallbacks used `BTC/USD` while the broker used `BTCUSD`, so the same asset never merged. | New `src/background/symbols.js` is the single authority. One canonical key per instrument, idempotent, used by the store, the journal, settings and the UI. Old snapshots and old journals are **merged/migrated on load** rather than duplicated. |
+| 4 | `SYMBOL_RE = /^[A-Z]{2,6}(?:\/[A-Z]{2,6})?(?:_OTC)?$/` accepted letters only. Any crypto name with a digit or a dash (`1000SHIBUSD`, `BTC-USD`) was **rejected outright and dropped without a trace** — on a platform that lists crypto. | Symbol acceptance now allows digits and dashes, guarded by a letter-count minimum and an explicit deny-list (`2probe`, `ping`, …) so widening the pattern cannot invent phantom instruments. |
+| 5 | Payouts were dropped two different ways: `setPayout()` returned silently if the symbol did not exist yet, and the parser only recorded a payout when the same node **also carried a price** — but the broker's asset list sends `{symbol, payout}` with no price. Net effect: the real payout was never captured, and a single global 86% was used for crypto and forex alike, making the break-even figure on screen wrong. | Payouts (and broker asset-type declarations) arriving early are **parked in an inbox** and applied the moment the instrument appears. The parser now records a payout with or without a price. `store.effectivePayout()` resolves live → class default → user setting, and reports which one it used so the UI can show it. |
+| 6 | `isOtc()` was **dead code** — defined and tested, never called. OTC, real forex and crypto were all judged by one volatility band and one payout default, so crypto was vetoed for being normally volatile while a dead OTC feed sailed through. Weekend forex produced confident signals off a frozen chart. | Each instrument is classified (`forex` · `crypto` · `commodity` · `synthetic` · `unknown`) from the broker's own declaration when present, otherwise from its name. Each class gets its own volatility band and payout default. Signals and backtests refuse a closed market — per bar in a replay, since a replay can span a weekend. |
+| + | `npm test` ran `node --test tests/`, which Node 22 resolves as a **module path**, not a test directory — so the suite failed before running a single test, and nothing could be verified. | `node --test`. The suite now runs, and covers all of the above: **231 tests**. |
+
+### Choosing a pair
+
+The Signal tab now opens with **BEST PAIR RIGHT NOW**. It is not a guess — it ranks every
+instrument on evidence the extension already holds and refuses to list anything it cannot
+justify:
+
+- **hard filters** (a pair failing any of these is listed with the reason, never ranked):
+  no live data · fewer than 40 closed candles · market closed for the weekend ·
+  payout below the break-even floor for its class · a trade already open on it
+- **scored 0–100**: current signal 40 · demonstrated edge 30 · data quality 20 ·
+  volatility fit 10
+
+Demonstrated edge uses a **Wilson 95% lower bound**, not a raw win rate: 2 wins from 2
+trades scores below 30 from 40, because two trades are not evidence. Every ranked pair and
+every rejection carries the reasons it was scored that way, printed in the UI.
 
 ---
 
@@ -67,6 +100,9 @@ src/
     patterns.js    candle anatomy, swing pivots, structure, S/R, break+retest
     indicators.js  sma ema rsi atr macd bollinger stochastic adx slope
     candles.js     timeframe aggregation, ring buffers, compact storage format
+    symbols.js     ONE authority on instrument identity: canonical key,
+                   asset class, volatility band, payout default, market hours
+    recommend.js   ranks the tradeable pairs and says which to trade, with reasons
     store.js       symbol registry + serialize/deserialize snapshot
     ledger.js      paper-trading ledger on chrome.storage.local
     journal.js     expectancy, profit factor, drawdown, breakdowns, CSV
@@ -81,7 +117,7 @@ src/
     panel/         side-panel dashboard (Chart · Signal · Journal · Backtest · Feed · Settings)
     popup/         compact status
     options/       site access, data export/import, docs
-tests/             119 tests — run with `npm test`
+tests/             231 tests — run with `npm test`
 ```
 
 ### How the feed works
@@ -144,7 +180,7 @@ rules concur. Six net points with every rule pointing the same way = 100%.
 npm test
 ```
 
-119 tests across 7 files:
+231 tests across 11 files:
 
 - `candles` — bucketing, aggregation, compact/expand round-trip
 - `indicators` — correctness against hand-computed values, plus a budget check that a full
@@ -157,6 +193,9 @@ npm test
 - `hud` — the content script executed against a fake DOM, asserting rendered output
 - `integration` — frames pushed through the real message surface into the real worker
   modules with a stubbed `chrome.*`, ending in a settled paper trade
+- `symbols` — canonical keys, asset classification, per-class bands, weekend sessions
+- `recommend` — every hard filter, the Wilson lower bound, ranking determinism
+- `lifecycle` — eviction/prune protection, the payout inbox, settlement and voiding
 
 ---
 
@@ -172,7 +211,14 @@ npm test
 - Binance and Yahoo are *proxies*. They are always labelled in the UI and are never mixed
   with live broker ticks for the same symbol.
 - `chrome.storage.session` holds ~24 instruments × 150 candles; older instruments are
-  pruned after two silent hours.
+  pruned after two silent hours. The pair you are watching, and any pair holding an
+  unsettled trade, are exempt from both pruning and eviction.
+- Weekend closure is evaluated in **UTC** against the broker-independent convention of
+  Friday 22:00 → Sunday 22:00. Brokers in other timezones may open slightly earlier or
+  later; the guard is deliberately conservative.
+- Asset class is inferred from the instrument name unless the broker declares one in the
+  payload. A name that matches nothing is classified `unknown` and falls back to your own
+  payout setting rather than being silently treated as forex.
 
 ---
 

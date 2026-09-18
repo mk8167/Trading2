@@ -13,17 +13,77 @@ test('symbol validation and formatting', () => {
   assert.ok(isSymbol('BTC/USD'));
   assert.ok(!isSymbol('TOOLONGSYMBOL/XYZ'));
   assert.ok(!isSymbol('abc'));
-  assert.equal(normalizeSymbol(' eur/usd_otc '), 'EUR/USD_OTC');
+  // Canonicalisation is the point: every spelling of one instrument must
+  // collapse onto ONE key, or its candle history splits in two and every
+  // number derived from it is computed from half the data.
+  assert.equal(normalizeSymbol(' eur/usd_otc '), 'EURUSD_OTC');
+  assert.equal(normalizeSymbol('EURUSD_otc'), normalizeSymbol('eur/usd_otc'));
+  assert.equal(normalizeSymbol('USD/CAD_otc'), normalizeSymbol('USDCAD_OTC'));
+  assert.equal(normalizeSymbol('BTC/USD'), normalizeSymbol('btc-usd'));
   assert.equal(prettySymbol('EURUSD_OTC'), 'EUR/USD OTC');
   assert.equal(prettySymbol('BTC/USD'), 'BTC/USD');
   assert.ok(isOtc('XAUUSD_otc'));
   assert.ok(!isOtc('XAU/USD'));
 });
 
+test('crypto names carrying digits or dashes are no longer dropped', () => {
+  // The old `[A-Z]{2,6}` pattern rejected all of these, silently.
+  assert.ok(isSymbol('BTCUSDT'));
+  assert.ok(isSymbol('1000SHIBUSD'));
+  assert.ok(isSymbol('BTC-USD'));
+  assert.equal(normalizeSymbol('1000SHIB/USDT'), '1000SHIBUSDT');
+  const r = extract(JSON.stringify({ symbol: 'BTCUSDT', price: 65432.1, t: TS }));
+  assert.equal(r.ticks.length, 1);
+  assert.equal(r.ticks[0].sym, 'BTCUSDT');
+});
+
+test('a payout is captured even when the frame carries no price', () => {
+  // This is the shape of the broker's asset list, and it is the ONLY place
+  // the real payout is ever announced.
+  const r = extract(JSON.stringify({ symbol: 'PLAT/USD_otc', payout: 79 }));
+  assert.equal(r.payouts.length, 1, 'an asset-list frame must yield its payout');
+  assert.equal(r.payouts[0].sym, 'PLATUSD_OTC');
+  assert.equal(r.payouts[0].payout, 79);
+  assert.equal(r.ticks.length, 0, 'and no tick is invented from it');
+
+  // A whole asset list in one frame.
+  const list = extract(JSON.stringify({ assets: [
+    { s: 'EURUSD_otc', payout: 92 },
+    { s: 'BTCUSD', payout: 76 },
+    { s: 'XAUUSD', payout: 84 },
+  ] }));
+  assert.equal(list.payouts.length, 3);
+  assert.deepEqual(list.payouts.map((p) => p.sym), ['EURUSD_OTC', 'BTCUSD', 'XAUUSD']);
+
+  // Out-of-range payouts are still refused.
+  assert.equal(extract(JSON.stringify({ symbol: 'EURUSD_otc', payout: 0 })).payouts.length, 0);
+  assert.equal(extract(JSON.stringify({ symbol: 'EURUSD_otc', payout: 500 })).payouts.length, 0);
+});
+
+test('price and payout together still produce both, exactly once each', () => {
+  const r = extract(JSON.stringify({ symbol: 'EURUSD_otc', price: 1.08, payout: 92, t: TS }));
+  assert.equal(r.ticks.length, 1);
+  assert.equal(r.payouts.length, 1, 'no duplicate payout entry');
+});
+
+test('a broker-declared asset type is captured as authoritative metadata', () => {
+  const r = extract(JSON.stringify({ symbol: 'XYZUSD', type: 'crypto', price: 1.5, t: TS }));
+  assert.equal(r.meta.length, 1);
+  assert.equal(r.meta[0].sym, 'XYZUSD');
+  assert.equal(r.meta[0].type, 'crypto');
+  assert.ok(r.methods.includes('asset-type'));
+
+  const r2 = extract(JSON.stringify({ symbol: 'EURUSD', otc: true, price: 1.1, t: TS }));
+  assert.equal(r2.meta[0].otc, true);
+
+  // No type field -> no metadata, and nothing crashes.
+  assert.equal(extract(JSON.stringify({ symbol: 'EURUSD', price: 1.1, t: TS })).meta.length, 0);
+});
+
 test('parses the real Quotex array tick shape', () => {
   const r = extract('["USD/CAD_otc",' + TS + '.68,1.41746,1]');
   assert.equal(r.ticks.length, 1);
-  assert.equal(r.ticks[0].sym, 'USD/CAD_OTC');
+  assert.equal(r.ticks[0].sym, 'USDCAD_OTC', 'slash form collapses onto the canonical key');
   assert.equal(r.ticks[0].price, 1.41746);
   assert.equal(r.ticks[0].ts, 1_789_690_148_680, 'fractional seconds are preserved');
   assert.ok(r.methods.includes('json-walk'));
@@ -61,7 +121,7 @@ test('falls back to regex when the payload is not valid JSON', () => {
   const broken = 'garbage-prefix 42["tick","USD/CAD_otc",' + TS + '.5,1.41746,1 truncated-json';
   const r = extract(broken);
   assert.equal(r.ticks.length >= 1, true, 'regex fallback should still find the tick');
-  assert.equal(r.ticks[0].sym, 'USD/CAD_OTC');
+  assert.equal(r.ticks[0].sym, 'USDCAD_OTC');
   assert.ok(r.methods.includes('regex'));
 });
 

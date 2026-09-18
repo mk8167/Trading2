@@ -15,8 +15,14 @@ export const DEFAULTS = {
   strategy: {
     minScore: 3,
     minPayout: 70,
+    // Only used when useClassBands is false, or for a pair whose asset class
+    // could not be determined. Each class otherwise gets its own band from
+    // symbols.js, because one shared band judged crypto by forex standards
+    // and OTC by crypto standards.
     maxVolatility: 0.02,
     minVolatility: 0.0002,
+    useClassBands: true,
+    respectMarketHours: true,
     useMtf: true,
     usePatterns: true,
     useLevels: true,
@@ -26,6 +32,8 @@ export const DEFAULTS = {
     gateMargin: 0.03,
     maxLossStreak: 5,
   },
+  /** How many pairs the "what should I trade" list shows. */
+  recommend: { limit: 5, minBars: 40 },
   hud: { enabled: true, side: 'right', compact: false, showChart: true },
   feeds: { binance: true, yahoo: true, binanceMs: 30_000, yahooMs: 60_000 },
   chart: { ema: [9, 21], levels: true, markers: true, candles: 90 },

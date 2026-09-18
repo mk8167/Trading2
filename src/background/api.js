@@ -12,10 +12,12 @@ import * as settings from './settings.js';
 import * as engine from './engine.js';
 import { handleBatch } from './feeds/quotex.js';
 import { runBacktest, summarise, walkForward } from './backtest.js';
-import { toCSV, bySetup, bySymbol, byTimeframe, byDirection } from './journal.js';
+import { toCSV, bySetup, bySymbol, byTimeframe, byDirection, byClass, voidTrade } from './journal.js';
 import { CRYPTO } from './feeds/binance.js';
 import { FX } from './feeds/yahoo.js';
 import { bucketOf, TF_MS } from './candles.js';
+import { canonical } from './symbols.js';
+import { recommend } from './recommend.js';
 
 const BRIDGE_IDS = ['qsync-bridge-main', 'qsync-hud'];
 
@@ -28,8 +30,13 @@ export async function handleMessage(msg, sender) {
         return await stateGet(msg);
 
       case 'symbols.select': {
-        const s = await settings.patch({ selectedSym: msg.sym || null });
-        engine.invalidate(s.selectedSym);
+        // Store the canonical key, and protect it immediately: selecting a
+        // pair is exactly the moment its history becomes worth keeping.
+        const key = msg.sym ? canonical(msg.sym) : null;
+        const s = await settings.patch({ selectedSym: key });
+        store.setSelected(key);
+        store.protectOpen(ledger.openSymbols());
+        engine.invalidate(key);
         return { ok: true, selectedSym: s.selectedSym };
       }
 
@@ -41,8 +48,14 @@ export async function handleMessage(msg, sender) {
         return { ok: true, settings: await settings.load() };
 
       case 'settings.patch': {
-        const next = await settings.patch(msg.patch || {});
-        if (msg.patch?.selectedSym !== undefined) engine.invalidate(next.selectedSym);
+        const patch = { ...(msg.patch || {}) };
+        if (patch.selectedSym !== undefined) patch.selectedSym = patch.selectedSym ? canonical(patch.selectedSym) : null;
+        const next = await settings.patch(patch);
+        if (patch.selectedSym !== undefined) {
+          store.setSelected(next.selectedSym);
+          store.protectOpen(ledger.openSymbols());
+          engine.invalidate(next.selectedSym);
+        }
         return { ok: true, settings: next };
       }
 
@@ -63,9 +76,21 @@ export async function handleMessage(msg, sender) {
       case 'journal.trade.close': {
         const t = ledger.trades.find((x) => x.id === msg.id && !x.result);
         if (!t) return { ok: false, err: 'not found' };
-        ledger.settleTrade(t, msg.price ?? t.entry);
+        // Settling at `t.entry` when no price is supplied used to guarantee a
+        // tie, silently erasing the trade's real result. Use the last known
+        // price; if there genuinely is none, void it rather than invent one.
+        const st = store.getSymbol(t.sym);
+        const price = Number.isFinite(msg.price) && msg.price > 0
+          ? msg.price
+          : (st && Number.isFinite(st.price) && st.price > 0 ? st.price : null);
+        if (price == null) {
+          voidTrade(t, 'closed manually with no price available');
+          ledger.logEvent('void', `VOID ${t.sym} ${t.dir} — closed with no settlement price`, { tradeId: t.id });
+        } else {
+          ledger.settleTrade(t, price);
+        }
         ledger.persist();
-        return { ok: true };
+        return { ok: true, result: t.result, pnl: t.pnl };
       }
 
       /* ---------------- feed intake ---------------- */
@@ -120,7 +145,8 @@ export async function handleMessage(msg, sender) {
         const result = runBacktest(base, {
           sym,
           tf: msg.tf === 'm5' ? 'm5' : 'm1',
-          payout: msg.payout ?? (Number.isFinite(st.payout) ? st.payout : s.payout),
+          assetClass: st.assetClass || null,
+          payout: msg.payout ?? store.effectivePayout(sym, s.payout).payout,
           stake: msg.stake ?? Math.max(0.01, ((s.balance || 100) * (s.riskPct || 1)) / 100),
           expiryBars: msg.expiryBars ?? s.expiryMinutes,
           warmup: msg.warmup ?? 60,
@@ -149,7 +175,8 @@ export async function handleMessage(msg, sender) {
         const wf = walkForward(base, {
           sym,
           tf: msg.tf === 'm5' ? 'm5' : 'm1',
-          payout: msg.payout ?? (Number.isFinite(st.payout) ? st.payout : s.payout),
+          assetClass: st.assetClass || null,
+          payout: msg.payout ?? store.effectivePayout(sym, s.payout).payout,
           stake: msg.stake ?? 1,
           expiryBars: msg.expiryBars ?? s.expiryMinutes,
           warmup: msg.warmup ?? 60,
@@ -201,8 +228,12 @@ async function hasPermission(pattern) {
 
 async function stateGet(msg) {
   const s = await settings.load();
-  const sym = msg.sym || s.selectedSym || autoSelect();
+  const wanted = msg.sym ? canonical(msg.sym) : s.selectedSym ? canonical(s.selectedSym) : null;
+  const sym = wanted || autoSelect();
   if (sym && sym !== s.selectedSym) await settings.patch({ selectedSym: sym });
+  // Marking it selected is what keeps this pair's candle history alive
+  // through eviction and the stale-prune.
+  store.setSelected(sym);
 
   const ev = sym ? engine.evaluate(sym, s) : { signal: null, open: [], settled: [], newBar: false };
   const st = sym ? store.getSymbol(sym) : null;
@@ -216,6 +247,9 @@ async function stateGet(msg) {
     symbol: st
       ? {
           sym: st.sym,
+          pretty: st.pretty,
+          assetClass: st.assetClass,
+          otc: !!st.otc,
           source: st.source,
           price: Number.isFinite(st.price) ? st.price : null,
           ts: st.ts,
@@ -234,12 +268,16 @@ async function stateGet(msg) {
       : { m1: [], m5: [], m15: [] },
     signal: ev.signal,
     preview: ev.preview || null,
+    effectivePayout: Number.isFinite(ev.payout) ? { payout: ev.payout, origin: ev.payoutOrigin || 'setting' } : null,
+    assetClass: ev.assetClass || null,
+    marketOpen: ev.marketOpen !== false,
     secondsToClose: ev.secondsToClose ?? null,
     sync: buildSync(st, ev.tf, msg.now || Date.now()),
     openTrades: ev.open,
     journal: journalPayload(s),
     symbols: store.listSymbols(),
-    catalog: { quotex: store.listSymbols().filter((x) => x.source === 'quotex').map((x) => x.sym), crypto: Object.keys(CRYPTO), fx: Object.keys(FX) },
+    catalog: buildCatalog(),
+    recommend: recommendPairs(s),
     diag: {
       frames: store.diag.frames,
       ticks: store.diag.ticks,
@@ -285,8 +323,43 @@ function journalPayload(s) {
       symbol: bySymbol(ledger.trades).slice(0, 10),
       timeframe: byTimeframe(ledger.trades),
       direction: byDirection(ledger.trades),
+      assetClass: byClass(ledger.trades),
     },
   };
+}
+
+/**
+ * The selectable universe, as canonical keys.
+ *
+ * A pair the broker streams live is listed once, under Quotex; the REST
+ * fallbacks only offer it when the live feed does not, so the same
+ * instrument can never appear twice in the picker and be stored twice.
+ */
+function buildCatalog() {
+  const all = store.listSymbols();
+  const have = new Set(all.map((x) => x.sym));
+  const quotex = all.filter((x) => x.source === 'quotex').map((x) => x.sym);
+  const crypto = Object.keys(CRYPTO).map(canonical).filter((k) => !have.has(k));
+  const fx = Object.keys(FX).map(canonical).filter((k) => !have.has(k) && !crypto.includes(k));
+  return { quotex, crypto, fx };
+}
+
+/**
+ * Rank the tradeable pairs and say which one to trade right now.
+ * Delegates to recommend.js so the scoring can be unit-tested on its own.
+ */
+function recommendPairs(settings) {
+  try {
+    return recommend(store.listSymbols(), ledger.trades, {
+      settings,
+      signalOf: (sym) => engine.currentSignal(sym),
+      payoutOf: (sym) => store.effectivePayout(sym, settings.payout),
+      openSymbols: ledger.openSymbols(),
+    });
+  } catch (e) {
+    store.noteError(`recommend: ${e?.message || e}`);
+    return { best: null, ranked: [], why: String(e?.message || e) };
+  }
 }
 
 /** Prefer a live Quotex pair, then anything live, then the first known symbol. */
