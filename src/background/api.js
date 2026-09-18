@@ -18,8 +18,31 @@ import { FX } from './feeds/yahoo.js';
 import { bucketOf, TF_MS } from './candles.js';
 import { canonical } from './symbols.js';
 import { recommend } from './recommend.js';
+import * as selectFeed from './feeds/select.js';
 
 const BRIDGE_IDS = ['qsync-bridge-main', 'qsync-hud'];
+
+/**
+ * Make a pair the watched one — and go and get its data.
+ *
+ * Selecting a pair used to stop at writing a name into settings: no symbol was
+ * created, no request was fired, and the two REST fallbacks kept polling their
+ * own rotations, so 66 of the picker's 67 options rendered an empty chart and a
+ * "no data" signal. `selectFeed.request()` is what turns the click into a
+ * fetch (and, when no feed can serve the pair, into an explanation the UI can
+ * print instead of a blank).
+ *
+ * @param {string|null} key canonical key
+ * @param {object|null} [already] settings already patched by the caller
+ */
+async function applySelection(key, already = null) {
+  const s = already || (await settings.patch({ selectedSym: key }));
+  store.setSelected(key);
+  store.protectOpen(ledger.openSymbols());
+  engine.invalidate(key);
+  selectFeed.request(key);
+  return s;
+}
 
 export async function handleMessage(msg, sender) {
   if (!msg || typeof msg.cmd !== 'string') return { ok: false, err: 'bad message' };
@@ -30,14 +53,12 @@ export async function handleMessage(msg, sender) {
         return await stateGet(msg);
 
       case 'symbols.select': {
-        // Store the canonical key, and protect it immediately: selecting a
-        // pair is exactly the moment its history becomes worth keeping.
+        // Store the canonical key, protect it immediately — selecting a pair is
+        // exactly the moment its history becomes worth keeping — and start the
+        // fetch that makes the selection mean something.
         const key = msg.sym ? canonical(msg.sym) : null;
-        const s = await settings.patch({ selectedSym: key });
-        store.setSelected(key);
-        store.protectOpen(ledger.openSymbols());
-        engine.invalidate(key);
-        return { ok: true, selectedSym: s.selectedSym };
+        const s = await applySelection(key);
+        return { ok: true, selectedSym: s.selectedSym, selection: selectFeed.describe(key) };
       }
 
       case 'symbols.list':
@@ -51,11 +72,7 @@ export async function handleMessage(msg, sender) {
         const patch = { ...(msg.patch || {}) };
         if (patch.selectedSym !== undefined) patch.selectedSym = patch.selectedSym ? canonical(patch.selectedSym) : null;
         const next = await settings.patch(patch);
-        if (patch.selectedSym !== undefined) {
-          store.setSelected(next.selectedSym);
-          store.protectOpen(ledger.openSymbols());
-          engine.invalidate(next.selectedSym);
-        }
+        if (patch.selectedSym !== undefined) await applySelection(next.selectedSym, next);
         return { ok: true, settings: next };
       }
 
@@ -284,6 +301,13 @@ async function stateGet(msg) {
     assetClass: ev.assetClass || null,
     marketOpen: ev.marketOpen !== false,
     secondsToClose: ev.secondsToClose ?? null,
+    /**
+     * Why the selected pair does or does not have data, in words the UI can
+     * print instead of leaving an empty chart to be interpreted as a broken
+     * extension. `pending` is true while the fetch a selection kicked off is
+     * still in the air, so "fetching…" can be shown rather than "no feed".
+     */
+    selection: selectFeed.describe(sym),
     sync: buildSync(st, ev.tf, msg.now || Date.now(), s),
     openTrades: ev.open,
     // Starting balance plus realized P&L, and whether it can still cover a

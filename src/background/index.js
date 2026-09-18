@@ -16,6 +16,7 @@ import * as engine from './engine.js';
 import { handleMessage } from './api.js';
 import { candidatesToScore } from './recommend.js';
 import { setSiteChartHandler } from './feeds/quotex.js';
+import { setSelectionNotifier } from './feeds/select.js';
 import { decideFollow } from './sync.js';
 import * as binance from './feeds/binance.js';
 import * as yahoo from './feeds/yahoo.js';
@@ -111,6 +112,13 @@ async function boot() {
     }
   });
 
+  /* A pair the user picks is fetched straight away (feeds/select.js), and when
+   * that request lands the chart has to fill in rather than wait for the next
+   * scheduled port push. Injected instead of imported: select.js is reached
+   * through api.js, which this file already imports, so importing notifyData
+   * back the other way would be a cycle through the worker's own entry point. */
+  setSelectionNotifier(() => notifyData());
+
   startHeartbeat();
 }
 
@@ -201,14 +209,20 @@ async function tick() {
     }
   }
 
+  // Both fallbacks are told which pair is on screen. Without that they served
+  // their own agendas — Binance a six-pair discovery rotation, Yahoo a single
+  // oldest-first pick out of 37 — so the pair the user had just selected could
+  // wait minutes for a top-up while pairs nobody had opened were refreshed.
+  const watching = store.selected;
+
   if (s.feeds?.binance && now - last.binance >= (s.feeds.binanceMs || 30_000)) {
     last.binance = now;
-    for (const pair of binance.pairsToPoll()) binance.poll(pair);
+    for (const pair of binance.pairsToPoll(watching)) binance.poll(pair);
   }
 
   if (s.feeds?.yahoo && now - last.yahoo >= (s.feeds.yahooMs || 60_000)) {
     last.yahoo = now;
-    const pair = yahoo.nextPair(lastYahooStamp);
+    const pair = yahoo.nextPair(lastYahooStamp, watching);
     lastYahooStamp[pair] = now;
     yahoo.poll(pair);
   }

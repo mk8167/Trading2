@@ -9,6 +9,7 @@
 
 import * as store from '../store.js';
 import { upsertCandle, DEFAULT_CAP } from '../candles.js';
+import { canonical } from '../symbols.js';
 
 /** Pair -> Yahoo symbol. Delayed, rotated one at a time, always labelled. */
 export const FX = {
@@ -108,9 +109,27 @@ export async function poll(pair, { signal } = {}) {
   return false;
 }
 
-/** Least-recently-polled FX pair — used to rotate fairly. */
-export function nextPair(lastPoll = {}) {
+/**
+ * How long the selected pair may go without a refresh before it takes the
+ * next poll slot ahead of the rotation.
+ *
+ * Yahoo is one pair per cycle (`yahooMs`, 60 s by default) and the list holds
+ * 37, so a purely oldest-first rotation meant a freshly picked FX pair could
+ * wait ~37 minutes for its first top-up. Two cycles is enough to keep the pair
+ * on screen fresh without starving discovery, which is what warms the other
+ * pairs the "best pair" board ranks.
+ */
+export const SELECTED_REFRESH_MS = 120_000;
+
+/** Least-recently-polled FX pair — used to rotate fairly. The pair the user is
+ *  watching takes the slot when it has gone `SELECTED_REFRESH_MS` without one. */
+export function nextPair(lastPoll = {}, selected = null) {
   const keys = Object.keys(FX);
+  const sel = selected ? canonical(selected) : '';
+  if (sel) {
+    const want = keys.find((k) => canonical(k) === sel);
+    if (want && Date.now() - (lastPoll[want] || 0) >= SELECTED_REFRESH_MS) return want;
+  }
   let pick = keys[0];
   let oldest = Infinity;
   for (const k of keys) {

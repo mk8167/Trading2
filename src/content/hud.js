@@ -360,7 +360,17 @@
       el.warn.classList.remove('hidden');
       el.body.classList.add('hidden');
       const g = s.diag || {};
-      if (g.ticks > 0) el.warn.textContent = 'Feed live — pair has no closed candles yet. Give it a minute.';
+      // A pair-level explanation beats "give it a minute" once the hook itself
+      // is clearly working: waiting is exactly the wrong advice for an OTC pair
+      // or one the broker owns but has stopped streaming, because no amount of
+      // waiting will produce data this extension is allowed to fetch.
+      const sel = s.selection;
+      const pairNote =
+        sel && sel.text && sel.reason !== 'broker-live' && sel.reason !== 'proxy-live'
+          ? (sel.pending ? '⏳ ' : '') + sel.text
+          : null;
+      if (g.sockets > 0 && pairNote) el.warn.textContent = pairNote;
+      else if (g.ticks > 0) el.warn.textContent = 'Feed live — pair has no closed candles yet. Give it a minute.';
       else if (g.frames > 0) el.warn.textContent = 'Frames arriving but not decoded — dashboard → Feed → Protocol Lab shows the shape.';
       else if (g.sockets > 0) el.warn.textContent = 'A socket opened but its frames are not visible here (likely a Web Worker).';
       else el.warn.textContent = 'No socket seen on this page. On a mirror domain? Options → Site access → grant it, then reload.';

@@ -4,6 +4,18 @@ import { pretty } from '../../background/symbols.js';
 const $ = (id) => document.getElementById(id);
 const LABEL = { up: '▲ CALL / UP', down: '▼ PUT / DOWN', veto: '⛔ BLOCKED', none: '— NO EDGE', wait: '⏳ WARMING UP' };
 
+/** Picker markers, mirroring panel.js: a pair that cannot be fed here has to
+ *  look different from one that is about to be fetched. */
+const MARK = { live: '●', idle: '○', fetch: '↓', site: '⚠' };
+
+function markOf(info, siteGroup) {
+  if (info) {
+    if (info.bars > 0) return info.stale ? 'idle' : 'live';
+    return info.source === 'quotex' ? 'site' : 'fetch';
+  }
+  return siteGroup ? 'site' : 'fetch';
+}
+
 const send = (cmd, payload = {}) =>
   new Promise((resolve) => {
     try {
@@ -21,18 +33,23 @@ function render(d) {
   const sym = d.symbol;
   const conn = $('conn');
   const src = sym?.source;
-  conn.textContent = '● ' + (!sym ? 'no feed' : sym.stale ? 'idle' : src === 'quotex' ? 'quotex' : src);
-  conn.className = 'conn ' + (!sym ? '' : sym.stale ? 'idle' : 'live');
+  // A fetch started by picking this pair is not "no feed" — it is on its way.
+  const fetching = !sym && !!d.selection?.pending;
+  conn.textContent = (fetching ? '↓ fetching…' : '● ' + (!sym ? 'no feed' : sym.stale ? 'idle' : src === 'quotex' ? 'quotex' : src));
+  conn.className = 'conn ' + (fetching ? 'idle' : !sym ? '' : sym.stale ? 'idle' : 'live');
 
   const cat = d.catalog || {};
+  const bySym = new Map((d.symbols || []).map((s) => [s.sym, s]));
   const groups = [
-    ['Quotex live', cat.quotex || []],
-    ['Crypto', cat.crypto || []],
-    ['FX proxy', cat.fx || []],
+    ['Quotex (site feed)', cat.quotex || [], true],
+    ['Crypto', cat.crypto || [], false],
+    ['FX proxy', cat.fx || [], false],
   ];
   const html = groups
     .filter(([, l]) => l.length)
-    .map(([n, l]) => `<optgroup label="${n}">${l.map((s) => `<option value="${s}">${pretty(s)}</option>`).join('')}</optgroup>`)
+    .map(([n, l, site]) => `<optgroup label="${n}">${l
+      .map((s) => `<option value="${s}">${MARK[markOf(bySym.get(s), site)]} ${pretty(s)}</option>`)
+      .join('')}</optgroup>`)
     .join('');
   const sel = $('pair');
   if (sel.dataset.sig !== html) {
@@ -41,6 +58,19 @@ function render(d) {
   }
   if (d.selectedSym && sel.value !== d.selectedSym) sel.value = d.selectedSym;
   if ($('tf').value !== (d.settings?.tf || 'm1')) $('tf').value = d.settings?.tf || 'm1';
+
+  const note = $('pairNote');
+  const sn = d.selection;
+  if (note) {
+    if (!sn || !sn.text) {
+      note.textContent = '';
+      note.className = 'pnote';
+    } else {
+      const good = sn.reason === 'broker-live' || sn.reason === 'proxy-live';
+      note.className = 'pnote ' + (sn.pending ? 'wait' : good ? 'ok' : 'warn');
+      note.textContent = (sn.pending ? '⏳ ' : good ? '' : '⚠ ') + sn.text;
+    }
+  }
 
   const sig = d.signal || { dir: 'wait', summary: 'no data', confidence: 0 };
   const box = $('sig');

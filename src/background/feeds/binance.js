@@ -97,20 +97,29 @@ const DISCOVER = 6;
 let cursor = 0;
 
 /** Pairs worth a REST call right now: everything we hold, plus a rotating
- *  slice of the fallback list we have not seen yet. */
-export function pairsToPoll() {
+ *  slice of the fallback list we have not seen yet.
+ *
+ *  `selected` (a canonical key, or anything canonical() accepts) jumps the
+ *  queue. The pair the user is actually looking at must never wait behind the
+ *  discovery rotation: with six unseen pairs per 30 s cycle and 30+ in the
+ *  list, a freshly picked crypto pair could sit for minutes while the poller
+ *  refreshed pairs nobody had opened. It is prepended and de-duplicated, so
+ *  the per-cycle bound still holds. */
+export function pairsToPoll(selected = null) {
   const all = Object.keys(CRYPTO);
   const held = new Set(store.listSymbols().map((x) => x.sym));
   const known = all.filter((p) => held.has(canonical(p)));
   const unseen = all.filter((p) => !held.has(canonical(p)));
+  const sel = selected ? canonical(selected) : '';
+  const want = sel ? all.find((p) => canonical(p) === sel) || null : null;
   if (!unseen.length) {
     cursor = 0;
-    return known;
+    return [...new Set(want ? [want, ...known] : known)];
   }
   const start = cursor % unseen.length;
   cursor = (start + DISCOVER) % unseen.length;
   const rotated = [...unseen.slice(start), ...unseen.slice(0, start)].slice(0, DISCOVER);
-  return [...known, ...rotated];
+  return [...new Set(want ? [want, ...known, ...rotated] : [...known, ...rotated])];
 }
 
 export async function poll(pair, { signal } = {}) {

@@ -263,3 +263,98 @@ test('the header shows the manifest version, not a hardcoded one', () => {
   const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
   assert.equal(get('ver').textContent, 'v' + pkg.version);
 });
+
+/* ---------------------------- the pair picker -------------------------- */
+
+/* The picker listed ~67 instruments and exactly one of them could have data.
+ * Nothing on screen distinguished a streaming pair from one that was quiet,
+ * from one that would be fetched on selection, from one no external feed can
+ * ever serve — so picking a dead pair produced an empty chart and the only
+ * available reading was "the extension stopped working". These check the
+ * markers and the explanatory line actually render. */
+
+/** A catalog covering all four situations the markers have to tell apart. */
+function pickerPayload(over = {}) {
+  return payload({
+    catalog: {
+      quotex: ['EURUSD_OTC', 'GBPUSD', 'USDJPY_OTC'],
+      crypto: ['BTCUSD'],
+      fx: ['NZDJPY'],
+    },
+    symbols: [
+      { sym: 'EURUSD_OTC', pretty: 'EUR/USD OTC', source: 'quotex', otc: true, stale: false, bars: 60 },
+      { sym: 'GBPUSD', pretty: 'GBP/USD', source: 'quotex', otc: false, stale: true, bars: 40 },
+    ],
+    ...over,
+  });
+}
+
+test('the picker marks each pair with what its feed can actually do', () => {
+  render(pickerPayload(), 'chart');
+  const html = get('pair').innerHTML;
+  assert.match(html, /● EUR\/USD OTC/, 'streaming now');
+  assert.match(html, /○ GBP\/USD/, 'has candles but the feed went quiet');
+  assert.match(html, /⚠ USD\/JPY OTC/, 'only the site can ever feed this one');
+  assert.match(html, /↓ BTC\/USD/, 'no data yet, but picking it starts a fetch');
+  assert.match(html, /↓ NZD\/JPY/, 'same for the FX proxy list');
+  assert.match(html, /title="[^"]*only the site can feed/, 'and hovering says why');
+});
+
+test('the line under the picker explains a pair that cannot be fed here', () => {
+  render(
+    pickerPayload({
+      symbol: null,
+      selection: {
+        sym: 'USDJPY_OTC', reason: 'otc-site-only', pending: false,
+        text: 'USD/JPY OTC is broker-generated (OTC), so no external feed exists for it. Only the site can stream this pair — open its chart there.',
+      },
+    }),
+    'chart'
+  );
+  assert.match(get('pairNote').innerHTML, /broker-generated/, 'says what the pair is');
+  assert.match(get('pairNote').innerHTML, /Only the site can stream/, 'and what to do about it');
+  assert.match(get('pairNote').className, /warn/);
+});
+
+test('a fetch in flight reads as fetching, not as no feed', () => {
+  render(
+    pickerPayload({
+      symbol: null,
+      selection: { sym: 'BTCUSD', reason: 'proxy-cold', pending: true, text: 'BTC/USD has no data yet; fetching its history from binance…' },
+    }),
+    'chart'
+  );
+  assert.match(get('conn').textContent, /fetching/, 'the header must not claim the feed is dead');
+  assert.doesNotMatch(get('conn').textContent, /no feed/);
+  assert.match(get('pairNote').className, /wait/);
+  assert.match(get('pairNote').innerHTML, /fetching its history/);
+});
+
+test('a healthy live pair gets a plain note, not a warning', () => {
+  render(
+    pickerPayload({
+      selection: {
+        sym: 'EURUSD_OTC', reason: 'broker-live', pending: false,
+        text: "EUR/USD OTC is streaming from the site right now — this is the broker's own live feed.",
+      },
+    }),
+    'chart'
+  );
+  assert.match(get('pairNote').className, /ok/);
+  assert.doesNotMatch(get('pairNote').innerHTML, /⚠/);
+  assert.doesNotMatch(get('conn').textContent, /no feed/);
+});
+
+test('a payload with no selection verdict renders nothing and throws nothing', () => {
+  const d = pickerPayload();
+  delete d.selection;
+  assert.doesNotThrow(() => render(d, 'chart'));
+  assert.equal(get('pairNote').innerHTML, '');
+  assert.match(get('pairNote').className, /^pairnote$/);
+});
+
+test('the picker still works when the catalog arrives in the old shape', () => {
+  // The fixture this file has always used ships `catalog: []`; a worker that
+  // predates the object shape must not blank the picker or throw.
+  assert.doesNotThrow(() => render(payload(), 'chart'));
+});

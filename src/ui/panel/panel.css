@@ -54,6 +54,18 @@ code { background: var(--bg3); padding: 1px 4px; border-radius: 4px; font-size: 
 }
 #pair { flex: 1; }
 
+/* The line under the picker that says why this pair has data, is being
+ * fetched, or can only ever come from the site. Collapses to nothing when the
+ * worker has no opinion, so the layout is unchanged for a healthy live pair. */
+.pairnote {
+  font-size: 10.5px; line-height: 1.45; color: var(--mut);
+  padding: 6px 12px; border-bottom: 1px solid var(--line);
+}
+.pairnote:empty { display: none; }
+.pairnote.ok { color: #8fe0b4; }
+.pairnote.warn { color: var(--warn); }
+.pairnote.wait { color: var(--acc); }
+
 .signal {
   position: relative; margin: 10px 12px; padding: 11px 12px; border-radius: 12px;
   background: linear-gradient(135deg, #1b2430, #131a23); border: 1px solid rgba(255,255,255,.06);

@@ -41,6 +41,10 @@
     button:hover { background: #1b2b3a; color: #fff; }
     button.pri { background: #14395e; border-color: #2a5c8f; color: #cfe6ff; }
     .note { font-size: 9.5px; color: #5d6d7f; margin-top: 8px; text-align: center; }
+    /* Why the picked pair has data, is being fetched, or needs the site. */
+    .pnote { font-size: 9.5px; line-height: 1.4; color: #7c8ca0; margin: -3px 0 8px; }
+    .pnote:empty { display: none; }
+    .pnote.ok { color: #2fbf71; } .pnote.warn { color: #f5c33b; } .pnote.wait { color: #4ea1ff; }
   </style>
 </head>
 <body>
@@ -50,6 +54,7 @@
       <select id="pair"></select>
       <select id="tf" style="flex:0 0 54px"><option value="m1">1m</option><option value="m5">5m</option><option value="m15">15m</option></select>
     </div>
+    <div class="pnote" id="pairNote"></div>
     <div class="sig" id="sig">
       <span class="d" id="dir">⏳</span><span class="w" id="why">waiting for data…</span>
       <div class="conf"><i id="conf"></i></div>

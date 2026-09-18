@@ -183,11 +183,17 @@ function renderHeader(d) {
   const sym = d.symbol;
   const stale = !sym || sym.stale;
   const src = sym?.source;
+  // A selection that is being fetched right now must not read as "no feed":
+  // that is the exact moment the user concludes the pair picker is broken.
+  const fetching = !sym && !!d.selection?.pending;
   setConn(
-    !sym ? 'no feed' : stale ? 'idle' : src === 'quotex' ? 'quotex live' : src === 'binance' ? 'binance' : 'fx proxy',
-    !sym || stale ? (sym ? 'idle' : 'dead') : 'live'
+    fetching
+      ? 'fetching…'
+      : !sym ? 'no feed' : stale ? 'idle' : src === 'quotex' ? 'quotex live' : src === 'binance' ? 'binance' : 'fx proxy',
+    fetching ? 'idle' : !sym || stale ? (sym ? 'idle' : 'dead') : 'live'
   );
   fillPairs(d);
+  renderPairNote(d);
   const tf = $('tf');
   if (tf.value !== (d.settings?.tf || 'm1')) tf.value = d.settings?.tf || 'm1';
   const ex = $('expiry');
@@ -195,30 +201,86 @@ function renderHeader(d) {
   if (ex.value !== exv) ex.value = exv;
 }
 
+/**
+ * Feed markers for the pair picker.
+ *
+ * The list used to look the same whether a pair was streaming, sitting on last
+ * week's candles, or unreachable for good: one `·` beside the live ones and
+ * nothing beside the other 66. With no way to tell those apart, picking a dead
+ * pair produced an empty chart and the only available conclusion was that the
+ * extension had stopped working.
+ */
+const FEED_MARK = {
+  live: ['●', 'live feed — data flowing now'],
+  idle: ['○', 'has candles, but the feed has gone quiet'],
+  fetch: ['↓', 'no data yet — picking it fetches its history now'],
+  site: ['⚠', 'only the site can feed this pair — open its chart there'],
+};
+const FEED_LEGEND = Object.values(FEED_MARK)
+  .map(([m, t]) => `${m} ${t}`)
+  .join('  ·  ');
+
+/** Which marker a picker entry deserves, from what the store holds for it. */
+function feedMarkOf(info, siteGroup) {
+  if (info) {
+    if (info.bars > 0) return info.stale ? 'idle' : 'live';
+    // Known to the broker but empty: no proxy is allowed to fill it, so only
+    // the site can. A proxy-owned empty row will be fetched on selection.
+    return info.source === 'quotex' ? 'site' : 'fetch';
+  }
+  return siteGroup ? 'site' : 'fetch';
+}
+
 function fillPairs(d) {
   const sel = $('pair');
   const cat = d.catalog || {};
-  const live = (d.symbols || []).filter((s) => !s.stale).map((s) => s.sym);
+  const bySym = new Map((d.symbols || []).map((s) => [s.sym, s]));
   const known = new Set([...(cat.quotex || []), ...(cat.crypto || []), ...(cat.fx || [])]);
   const groups = [
-    ['Quotex live', cat.quotex || []],
-    ['Crypto (Binance)', cat.crypto || []],
-    ['FX proxy (Yahoo, delayed)', cat.fx || []],
+    ["Quotex (the site's own feed)", cat.quotex || [], true],
+    ['Crypto (Binance)', cat.crypto || [], false],
+    ['FX proxy (Yahoo, delayed)', cat.fx || [], false],
   ];
   const html = groups
     .filter(([, list]) => list.length)
-    .map(([label, list]) => `<optgroup label="${esc(label)}">${list
-      .map((s) => `<option value="${esc(s)}">${esc(pretty(s))}${live.includes(s) ? ' ·' : ''}</option>`)
+    .map(([label, list, siteGroup]) => `<optgroup label="${esc(label)}">${list
+      .map((s) => {
+        const [mark, tip] = FEED_MARK[feedMarkOf(bySym.get(s), siteGroup)];
+        return `<option value="${esc(s)}" title="${esc(tip)}">${mark} ${esc(pretty(s))}</option>`;
+      })
       .join('')}</optgroup>`)
     .join('');
   if (sel.dataset.sig !== html) {
     sel.innerHTML = html;
     sel.dataset.sig = html;
   }
+  if (sel.title !== FEED_LEGEND) sel.title = FEED_LEGEND;
   if (d.selectedSym && !known.has(d.selectedSym) && !sel.querySelector(`option[value="${CSS.escape(d.selectedSym)}"]`)) {
     sel.insertAdjacentHTML('afterbegin', `<option value="${esc(d.selectedSym)}">${esc(pretty(d.selectedSym))}</option>`);
   }
   if (sel.value !== d.selectedSym) sel.value = d.selectedSym || '';
+}
+
+/**
+ * One honest line under the picker.
+ *
+ * "no bars yet" told the user nothing they could act on. This says which feed
+ * the pair is on, whether a fetch is in the air, and — for the pairs that can
+ * never be fetched here — that only the site can stream them.
+ */
+function renderPairNote(d) {
+  const box = $('pairNote');
+  if (!box) return;
+  const s = d.selection;
+  if (!s || !s.text) {
+    if (box.innerHTML !== '') box.innerHTML = '';
+    box.className = 'pairnote';
+    return;
+  }
+  const good = s.reason === 'broker-live' || s.reason === 'proxy-live';
+  box.className = 'pairnote ' + (s.pending ? 'wait' : good ? 'ok' : 'warn');
+  const html = `${s.pending ? '⏳ ' : good ? '' : '⚠ '}${esc(s.text)}`;
+  if (box.innerHTML !== html) box.innerHTML = html;
 }
 
 function renderSignal(d) {
