@@ -44,7 +44,7 @@ with `chrome.scripting.registerContentScripts()`. Reload the tab afterwards.
 | **Backtester** | none | Replays the identical strategy with next-bar-open entry (no look-ahead) |
 | **Chart** | 60 hand-drawn bars, blurry on HiDPI | DPR-aware canvas, EMA overlays, S/R lines, trade markers, crosshair, wheel zoom, drag pan |
 | **UI** | One floating div on every page | Floating HUD (shadow DOM) + side-panel dashboard + popup + options page |
-| **Tests** | none | **231 automated tests**, `npm test` |
+| **Tests** | none | **234 automated tests**, `npm test` |
 
 ---
 
@@ -117,7 +117,7 @@ src/
     panel/         side-panel dashboard (Chart · Signal · Journal · Backtest · Feed · Settings)
     popup/         compact status
     options/       site access, data export/import, docs
-tests/             231 tests — run with `npm test`
+tests/             234 tests — run with `npm test`
 ```
 
 ### How the feed works
@@ -180,7 +180,7 @@ rules concur. Six net points with every rule pointing the same way = 100%.
 npm test
 ```
 
-231 tests across 11 files:
+234 tests across 11 files:
 
 - `candles` — bucketing, aggregation, compact/expand round-trip
 - `indicators` — correctness against hand-computed values, plus a budget check that a full

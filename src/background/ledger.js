@@ -71,24 +71,6 @@ export function openTrade({ sym, dir, entry, stake, payout, tf, expiryMinutes, s
   return t;
 }
 
-/** Close every trade whose expiry has passed, at the given price. */
-export function settleDue(sym, price, now = Date.now()) {
-  const key = canonical(sym) || sym;
-  const settled = [];
-  for (const t of trades) {
-    if (t.result) continue;
-    if (t.sym !== key) continue;
-    if (now < t.expiresAt) continue;
-    settleTrade(t, price, now);
-    settled.push(t);
-    logEvent(t.result === 'win' ? 'win' : t.result === 'loss' ? 'loss' : 'tie',
-      `${t.result.toUpperCase()} ${t.sym} ${t.dir} · ${(t.pnl >= 0 ? '+' : '')}${t.pnl.toFixed(2)}`,
-      { tradeId: t.id });
-  }
-  if (settled.length) persist();
-  return settled;
-}
-
 /**
  * Close every expired trade, on every symbol.
  *

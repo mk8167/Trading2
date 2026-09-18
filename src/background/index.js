@@ -130,6 +130,10 @@ async function tick() {
     last.housekeep = now;
     store.housekeep();
     store.pruneStale(2 * 60 * 60 * 1000);
+    // engine.prune() existed but nothing ever called it, so its signal cache
+    // and its per-symbol bar stamp grew without bound across a long session —
+    // every symbol the store ever saw, including ones evicted hours ago.
+    engine.prune(store.listSymbols().map((x) => x.sym));
   }
 }
 
