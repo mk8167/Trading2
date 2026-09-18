@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   extract, isSymbol, normalizeSymbol, prettySymbol, isOtc,
   stripEnvelope, rowToCandle, tryTickRow, sampleOf, decodeFrame, base64ToText,
+  asNumber, eventKind, singleCandleRow, singleTickRow,
 } from '../src/background/parsers/quotex.js';
 
 const TS = 1_789_690_148; // epoch seconds, the shape Quotex sends
@@ -199,4 +200,66 @@ test('extract never throws on hostile input', () => {
   for (const bad of [null, undefined, 123, {}, [], '{{{', '"', 'x'.repeat(300_000), '\u0000\u0001\u0002']) {
     assert.doesNotThrow(() => extract(bad));
   }
+});
+
+/* ------------------- shapes a live socket actually sends ------------- */
+
+/* The frames below are what a socket.io broker page sends. Each one used to
+ * fall through every extraction path: the payloads parse, but nothing was
+ * read out of them, so the site's chart moved while the extension sat still
+ * and the only trace was a Protocol Lab sample. */
+
+test('a price that arrives as a string is a price', () => {
+  const r = extract('42["quote",{"s":"EURUSD_otc","p":"1.0845","t":"1789690148"}]');
+  assert.equal(r.ticks.length, 1);
+  assert.equal(r.ticks[0].price, 1.0845);
+  assert.equal(r.ticks[0].ts, 1_789_690_148_000);
+  assert.equal(asNumber('1.0845'), 1.0845);
+  assert.equal(asNumber(' 2 '), 2);
+  assert.equal(asNumber('EURUSD'), null, 'a symbol is not a number');
+  assert.equal(asNumber('1.08.45'), null);
+});
+
+test('the regex fallback reads quoted numbers too', () => {
+  const r = extract('{"EURUSD_otc":{"price":"1.0845"}}'.replace(/"/g, '"') + '  ');
+  assert.equal(r.ticks.length, 1);
+  assert.equal(r.ticks[0].price, 1.0845);
+});
+
+test('a named socket.io event tells the parser what its numbers mean', () => {
+  assert.equal(eventKind('history'), 'candles');
+  assert.equal(eventKind('candles.update'), 'candles');
+  assert.equal(eventKind('quote'), 'tick');
+  assert.equal(eventKind('tick'), 'tick');
+  assert.equal(eventKind('balance'), null);
+});
+
+test('a candle sent on its own is stored, not ignored', () => {
+  const r = extract(`42["candle",{"s":"EURUSD_otc","data":[${TS},1.0840,1.0852,1.0838,1.0849]}]`);
+  assert.equal(r.history.length, 1);
+  assert.equal(r.history[0].sym, 'EURUSD_OTC');
+  assert.equal(r.history[0].rows[0].o, 1.084);
+  assert.equal(r.history[0].rows[0].c, 1.0849);
+});
+
+test('a one-off candle row with no event name is refused, not guessed', () => {
+  // No label and no parent symbol: [t,o,h,l,c] here is indistinguishable from
+  // any other list of five numbers, so it must not become a candle.
+  assert.equal(singleCandleRow([TS, 1, 2, 0.5, 1.5]) !== null, true);
+  const r = extract(`{"x":[${TS},1.0840,1.0852,1.0838,1.0849]}`);
+  assert.equal(r.history.length, 0, 'no symbol anywhere -> nothing to file it under');
+
+  // A flat row is a tick repeated, not a candle.
+  assert.equal(singleCandleRow([TS, 1.0845, 1.0845, 1.0845, 1.0845]), null);
+  // An array of five prices is not a candle either (no clock).
+  assert.equal(singleCandleRow([1.08, 1.09, 1.07, 1.085, 1.086]), null);
+});
+
+test('a bare [timestamp, price] pair from a quote event is a tick', () => {
+  assert.deepEqual(singleTickRow([TS, 1.0845]), { ts: TS, price: 1.0845 });
+  assert.deepEqual(singleTickRow([1.0845, TS]), { ts: TS, price: 1.0845 });
+  assert.equal(singleTickRow([1.0845, 1.0855]), null, 'two prices have no clock');
+  const r = extract(`42["quote",{"s":"EURUSD_otc","data":[[${TS},1.0845]]}]`);
+  assert.equal(r.ticks.length, 1);
+  assert.equal(r.ticks[0].price, 1.0845);
 });

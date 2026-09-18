@@ -8,9 +8,22 @@
  * ----------------------------------------------------------------*/
 
 import { decodeFrame, extract, sampleOf } from '../parsers/quotex.js';
+import { detectTf } from '../sync.js';
 import * as store from '../store.js';
 
 const NOISE = /^(\d{1,3}|2probe|3|0\{.*)$/;
+
+/**
+ * Handler installed by index.js, called once per history block the broker
+ * sends. A history block IS the chart the user has open on the site, so it is
+ * the signal the extension follows (settings.syncSite) to stay on the same
+ * pair and the same timeframe as the page.
+ */
+let siteChart = null;
+
+export function setSiteChartHandler(fn) {
+  siteChart = typeof fn === 'function' ? fn : null;
+}
 
 /**
  * @param {{text?:string,b64?:string,binary?:boolean,url?:string,frameId?:number}} frame
@@ -37,7 +50,18 @@ export function handleFrame(frame) {
       if (store.ingestTick(t.sym, t.price, t.ts, 'quotex')) out.ticks++;
     }
     for (const h of r.history) {
-      out.history += store.ingestHistory(h.sym, h.rows, 'quotex');
+      // The timeframe is measured from the block itself, so a 5- or 15-minute
+      // history can never be filed as 1-minute data (see store.ingestHistory).
+      const tf = detectTf(h.rows);
+      const stored = store.ingestHistory(h.sym, h.rows, 'quotex', null, tf ? { tf } : null);
+      out.history += stored;
+      if (stored && tf && siteChart) {
+        try {
+          siteChart({ sym: h.sym, tf, rows: stored, at: Date.now() });
+        } catch (e) {
+          store.noteError(`siteChart: ${e?.message || e}`);
+        }
+      }
     }
     for (const p of r.payouts) {
       store.setPayout(p.sym, p.payout);
@@ -48,6 +72,14 @@ export function handleFrame(frame) {
     for (const m of r.meta || []) {
       store.setMeta(m.sym, { type: m.type, otc: m.otc });
       out.meta++;
+    }
+
+    // Which extraction path found the data, counted per frame. Without this,
+    // "the socket is alive but nothing arrives" and "frames arrive in a shape
+    // we cannot read" look identical from the outside — and they need
+    // completely different fixes.
+    for (const m of r.methods) {
+      store.diag.methods[m] = (store.diag.methods[m] || 0) + 1;
     }
 
     if (!out.ticks && !out.history && !out.payouts && !out.meta) {

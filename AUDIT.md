@@ -109,3 +109,45 @@ Each fix was reverted (`git diff src > patch; git checkout -- src`) and the suit
 confirm the new tests fail without it: **18 failures** with the fixes removed, **0** with
 them applied. Two of those failures are whole-file (the new exports do not exist), the rest
 are the specific regression tests.
+
+---
+
+## 5. Follow-up work: v6.4.0 — staying on the same chart as the site
+
+Reported after the v6.3.0 audit, from live use:
+
+> *"site-er sathe extension proper sync hoi na, candle and number gulo thik thake na,
+> duijaigai duita chart dekhai"* — the site's chart and the extension's chart show
+> different candles and different numbers.
+
+Both charts were live and neither was internally broken. The extension was answering a
+question nothing in the pipeline asked — **which timeframe is this block in?** — and
+answering "1 minute" every time.
+
+| # | Problem | Fix | Test |
+|---|---|---|---|
+| 1 | Every history block was filed into the `m1` series regardless of the timeframe the broker sent it in, so a user on a 5- or 15-minute chart got an `m1` series that was a mixture of 1-minute tick bars and 5-minute broker bars. Indicators, `aggregate()`, the strategy's "last closed bar" and the drawn chart all read that mixture as 1-minute data. | `sync.detectTf()` (median gap + 80% agreement) routes a block to the series it belongs to; broker candles are kept per timeframe and win over derived ones in `refreshDerived()`, with newer tick-built bars appended so the chart still reaches "now". An unreadable block is counted (`Unreadable blocks`) and kept out rather than guessed into `m1`. | `tests/sync.test.mjs` |
+| 2 | A history block arriving newest-first left exactly one candle, because `upsertCandle` refuses to rewrite older history. | Rows are sorted before they are stored. | `tests/sync.test.mjs` |
+| 3 | Nothing read which pair/timeframe the *page* was showing — and a history block is exactly that. | `sync.decideFollow()` moves the extension onto the site's chart (rate-limited, timeframe only when the UI can draw it), switchable with `settings.syncSite`. | `tests/sync.test.mjs`, `tests/bootstrap.test.mjs` |
+| 4 | socket.io event names were ignored, a single candle row (`["candle", [t,o,h,l,c]]`) was not a block and so was dropped, and numeric strings (`"price":"1.0845"`) failed both the JSON walk and the regex path. | Event names are understood, single candle/tick rows are accepted with a name or parent symbol, numeric strings are read, each extraction path is counted per frame. A flat `[t,p,p,p,p]` row is refused so a repeated tick cannot invent a candle. | `tests/quotex-parser.test.mjs` |
+| 5 | The UI refreshed only on a timer (panel 1 s, HUD poll 1 s). | Data arriving in the worker pushes immediately: the panel over its port, the HUD via `feed.new` with a 200 ms floor, coalesced to one push per 250 ms. The 1 s poll stays as the safety net. | `tests/hud.test.mjs` (relay), manual |
+| 6 | A session restored from a pre-v6.4.0 snapshot could carry the polluted series back. | Snapshot v8 stores broker candles; on restore `sync.splitCoarseRuns()` moves same-spacing runs out of `m1` (a genuine 1-minute series with gaps is untouched), counted as `Series repaired`. | `tests/sync.test.mjs` |
+
+Also fixed: `feed.batch` counted a payload-less command envelope as a frame, inflating the
+"frames arrive but are not decoded" diagnosis; and the panel's candle-sync line now names the
+timeframe it is aligned to and which series is drawn, so "site m5 candles" and "computed on
+1m closes" cannot be read as the same thing.
+
+Still open after this work:
+
+- The strategy computes on 1-minute closes (`engine.evaluate` reads `s.tf.m1`) even when the
+  chart on screen is m5/m15. That is now stated in the UI (`sync.signalTf`, and a note beside
+  the chart) rather than changed: silently running the strategy on a different timeframe
+  would change when trades are taken, which is a decision for the user, not a bug fix.
+- socket.io binary attachments (`{"_placeholder":true,"num":0}` plus a separate binary frame)
+  are still not reassembled. Nothing observed sends market data that way, and guessing at the
+  correlation without a real payload is how the previous bugs happened.
+- Realtime delivery is verified at the message boundary, not in a live browser: the push path
+  is exercised by the HUD relay test and the worker tests, but the final leg (does the widget
+  redraw within 200 ms of a tick) can only be confirmed on the running extension.
+

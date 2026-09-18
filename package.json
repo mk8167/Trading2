@@ -1,6 +1,6 @@
 {
   "name": "qsync-pro",
-  "version": "6.3.0",
+  "version": "6.4.0",
   "private": true,
   "description": "Q-Sync Pro — Chrome MV3 market signal studio. No build step: the files in this folder are exactly what Chrome loads.",
   "type": "module",

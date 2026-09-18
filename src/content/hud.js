@@ -397,7 +397,6 @@
 
     el.px.textContent = fmt(sym.price);
     const payout = Number.isFinite(sym.payout) ? sym.payout : s.settings?.payout;
-    el.meta.textContent = 'pay ' + (payout ? payout + '%' : '?') + ' · ' + (s.candles?.m1?.length || 0) + ' bars';
 
     // settings.hud.showChart was written by the schema and read by nobody.
     if (el.spark) el.spark.style.display = s.settings?.hud?.showChart === false ? 'none' : '';
@@ -412,6 +411,14 @@
     const lastBar = cs[cs.length - 1];
     const rem = lastBar ? Math.max(0, Math.ceil((lastBar.t + ms - s.now) / 1000)) : 0;
     el.clk.textContent = rem > 0 ? rem + 's' : 'close';
+
+    // Say where the candles on screen came from. "site m5" means these are the
+    // broker's own candles for the chart the user has open — the only way the
+    // two charts can be compared honestly. They must be the series this widget
+    // just drew, which is why this line is here and not next to the price.
+    const fromSite = s.sync?.barsFrom === 'broker';
+    el.meta.textContent =
+      'pay ' + (payout ? payout + '%' : '?') + ' · ' + cs.length + (fromSite ? ` bars · site ${tf}` : ' bars');
 
     const open = (s.openTrades || [])[0];
     el.ticket.textContent = open
@@ -443,6 +450,23 @@
     } catch (e) {}
   }
 
+  /* The service worker pushes "feed.new" the moment a batch of market frames
+   * has been ingested, so the widget redraws on arrival instead of waiting for
+   * the next poll. The floor keeps a chatty socket (many batches per second)
+   * from re-rendering on every one of them. */
+  let lastPollAt = 0;
+  const POLL_FLOOR_MS = 200;
+  function pollSoon() {
+    const wait = Math.max(0, POLL_FLOOR_MS - (Date.now() - lastPollAt));
+    if (wait > 0) {
+      if (!soonTimer) soonTimer = setTimeout(() => { soonTimer = null; pollSoon(); }, wait);
+      return;
+    }
+    lastPollAt = Date.now();
+    poll();
+  }
+  let soonTimer = null;
+
   chrome.runtime.onMessage.addListener((m, sender, send) => {
     if (!m) return;
     if (m.cmd === 'hud.toggle') {
@@ -453,6 +477,8 @@
       if (!host) build();
       setVisible(true);
       send?.({ ok: 1 });
+    } else if (m.cmd === 'feed.new') {
+      pollSoon();
     }
   });
 

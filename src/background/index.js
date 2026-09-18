@@ -15,6 +15,8 @@ import * as settings from './settings.js';
 import * as engine from './engine.js';
 import { handleMessage } from './api.js';
 import { candidatesToScore } from './recommend.js';
+import { setSiteChartHandler } from './feeds/quotex.js';
+import { decideFollow } from './sync.js';
 import * as binance from './feeds/binance.js';
 import * as yahoo from './feeds/yahoo.js';
 import { canonical } from './symbols.js';
@@ -65,8 +67,55 @@ async function boot() {
   } catch {}
 
   if (s.feeds?.binance) await seedRest();
+
+  /* Follow the site.
+   *
+   * The broker sends candles for the chart the user has open, so a history
+   * block names the pair AND the timeframe the page is showing. Until now the
+   * extension ignored both: it kept its own pair and its own timeframe, which
+   * is why the site and the side panel could display two different charts of
+   * two different markets and neither was wrong. With settings.syncSite on
+   * (the default) the extension moves to what the page is showing.
+   *
+   * The decision itself is pure (sync.decideFollow) and rate-limited, so a
+   * burst of history frames cannot make the selection jump around. */
+  setSiteChartHandler(async (site) => {
+    try {
+      const cur = settings.peek();
+      const want = decideFollow({
+        site,
+        selected: cur?.selectedSym || null,
+        tf: cur?.tf || 'm1',
+        enabled: cur?.syncSite !== false,
+        lastFollowAt,
+        now: Date.now(),
+      });
+      if (!want) return;
+      lastFollowAt = Date.now();
+      // decideFollow speaks in the short names (sym/tf); the settings schema
+      // has its own. Passing the decision object straight to patch() would
+      // have written a `sym` key that no reader ever looks at — a silent
+      // no-op that looks exactly like "the feature does nothing".
+      const patch = {};
+      if (want.sym) patch.selectedSym = want.sym;
+      if (want.tf) patch.tf = want.tf;
+      await settings.patch(patch);
+      if (want.sym) {
+        store.setSelected(want.sym);
+        store.protectOpen(ledger.openSymbols());
+        engine.invalidate(want.sym);
+      }
+      notifyData();
+    } catch (e) {
+      store.noteError(`follow-site: ${e?.message || e}`);
+    }
+  });
+
   startHeartbeat();
 }
+
+/** Last time the selection moved to follow the site (rate limit). */
+let lastFollowAt = 0;
 
 /**
  * Backfill 1m history for crypto the broker told us about but sent no candles
@@ -197,9 +246,18 @@ function candidates(exclude = null) {
 
 /* ---------------------------- messaging ----------------------------- */
 
+/** Side-panel / popup connections that want a live payload. */
+const livePorts = new Set();
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   handleMessage(msg, sender)
-    .then((r) => sendResponse(r))
+    .then((r) => {
+      sendResponse(r);
+      // Market data just landed: push it out now rather than waiting for the
+      // next tick of a timer. The UI lagging behind the site by up to a second
+      // is half of what "it does not sync" means in practice.
+      if (msg?.cmd === 'feed.batch' && (r?.ticks || r?.history)) notifyData();
+    })
     .catch((e) => sendResponse({ ok: false, err: String(e?.message || e) }));
   return true; // keep the channel open for the async reply
 });
@@ -207,6 +265,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 chrome.runtime.onConnect.addListener((port) => {
   // Long-lived port used by the side panel for low-latency updates.
   if (port.name !== 'qsync') return;
+  livePorts.add(port);
   const push = async () => {
     try {
       const r = await handleMessage({ cmd: 'state.get' }, null);
@@ -215,8 +274,47 @@ chrome.runtime.onConnect.addListener((port) => {
   };
   push();
   const iv = setInterval(push, 1000);
-  port.onDisconnect.addListener(() => clearInterval(iv));
+  port.onDisconnect.addListener(() => {
+    clearInterval(iv);
+    livePorts.delete(port);
+  });
 });
+
+/**
+ * Push fresh state to everything that draws it, instead of waiting for a poll.
+ *
+ * Coalesced to one push per 250 ms: a busy socket delivers frames every few
+ * milliseconds, and rebuilding the payload (candles, indicators, ranker,
+ * journal) once per frame would cost more than the freshness is worth.
+ */
+let notifyTimer = null;
+export function notifyData() {
+  if (notifyTimer) return notifyTimer;
+  notifyTimer = setTimeout(async () => {
+    notifyTimer = null;
+    try {
+      if (livePorts.size) {
+        const r = await handleMessage({ cmd: 'state.get' }, null);
+        for (const p of livePorts) {
+          try {
+            p.postMessage(r);
+          } catch {
+            livePorts.delete(p);
+          }
+        }
+      }
+      // Content scripts do not receive runtime.sendMessage, so the HUD — which
+      // lives inside the page — is woken tab by tab, and only in the tabs we
+      // have actually heard a frame from.
+      for (const id of store.diag.bridges) {
+        try {
+          chrome.tabs.sendMessage(id, { cmd: 'feed.new' }).catch?.(() => {});
+        } catch {}
+      }
+    } catch {}
+  }, 250);
+  return notifyTimer;
+}
 
 /* ------------------------------ events ------------------------------ */
 

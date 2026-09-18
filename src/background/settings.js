@@ -37,6 +37,13 @@ export const DEFAULTS = {
   },
   /** How many pairs the "what should I trade" list shows. */
   recommend: { limit: 5, minBars: 40 },
+  /**
+   * Follow the broker's own chart: when the site sends history for a pair and
+   * timeframe, move the extension to that pair and timeframe. Off means the
+   * extension stays where the user put it, which is exactly how two charts end
+   * up showing two different markets.
+   */
+  syncSite: true,
   hud: { enabled: true, side: 'right', compact: false, showChart: true },
   feeds: { binance: true, yahoo: true, binanceMs: 30_000, yahooMs: 60_000 },
   chart: { ema: [9, 21], levels: true, markers: true, candles: 90 },

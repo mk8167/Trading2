@@ -1,4 +1,4 @@
-# ⚡ Q-Sync Pro — Market Signal Studio (v6.3.0)
+# ⚡ Q-Sync Pro — Market Signal Studio (v6.4.0)
 
 A Chrome MV3 extension that reads live market ticks straight from a broker page's own
 WebSocket, builds candles, scores multi-timeframe confluence signals, and keeps a
@@ -44,7 +44,7 @@ with `chrome.scripting.registerContentScripts()`. Reload the tab afterwards.
 | **Backtester** | none | Replays the identical strategy with next-bar-open entry (no look-ahead) |
 | **Chart** | 60 hand-drawn bars, blurry on HiDPI | DPR-aware canvas, EMA overlays, S/R lines, trade markers, crosshair, wheel zoom, drag pan |
 | **UI** | One floating div on every page | Floating HUD (shadow DOM) + side-panel dashboard + popup + options page |
-| **Tests** | none | **450 automated tests**, `npm test` |
+| **Tests** | none | **480 automated tests**, `npm test` |
 
 ---
 
@@ -67,6 +67,26 @@ settings that were saved and never read.
 | + | Coverage: the gate, the candle series, the journal break-even, the ranker's blind spot, the HUD switches and the bridge cap had **no tests**, which is why they could drift. | **450 tests across 21 files** (was 423 across 20). Every fix above was verified by reverting it and watching the new test fail. |
 
 ---
+
+## What changed from v6.3.0 → v6.4.0
+
+v6.3.0 fixed the arithmetic. v6.4.0 fixes **what the arithmetic was fed**.
+
+The complaint that started it: *the site's chart and the extension's chart show different
+candles and different numbers.* Both charts were live; neither was broken. The extension
+was simply answering a question nobody had asked it — **which timeframe is this block of
+candles in?** — and guessing the same answer every time: 1 minute.
+
+| # | Problem | Fix |
+|---|---|---|
+| 1 | **Every history block was filed as 1-minute data, whatever the broker sent.** The broker pushes candles for the chart the user has open, so a user on a 5- or 15-minute chart receives 5- and 15-minute candles. Those rows went straight into the `m1` series. The result was a series that was *not any timeframe*: real 1-minute bars (built from ticks) mixed with 5-minute bars, with indicators, `aggregate()`, the "last closed bar" the strategy fires on and the drawn chart all reading it as 1-minute data. Two charts that could never agree. | `sync.detectTf()` measures the spacing of the block (median gap, 80%-agreement guard) and `store.ingestHistory()` files the rows under the timeframe they are actually in — broker candles live in their own per-timeframe store, and `refreshDerived()` prefers them over anything aggregated from ticks, appending only the newer tick-built bars so the chart still reaches "now". A block whose spacing cannot be read is now **kept out and counted** (`Unreadable blocks` in Diagnostics) instead of being guessed into `m1`. |
+| 2 | **A history block that arrived newest-first lost every bar but one.** `upsertCandle()` deliberately refuses to rewrite older history, so a descending block left exactly one candle in the series. | Rows are sorted before they are stored. |
+| 3 | **The extension kept its own pair and its own timeframe.** Nothing in the data path read what the *page* was showing, and a history block is precisely that: the pair and timeframe the user has open. The side panel could sit on EUR/USD m1 while the site charted GBP/JPY m15, and both were "correct". | A history block now names the site's chart, and `sync.decideFollow()` moves the extension onto it — pair and timeframe, rate-limited to one switch per 5 s, following the timeframe only when the UI can draw it. Switchable in Settings (*Follow the site*, default on). |
+| 4 | **Frames in shapes the parser did not read.** socket.io names its events — `42["quote",{"s":"EURUSD_otc","p":"1.0845"}]`, `42["candle",{...}]` — and the numeric-looking values are sometimes strings. The walk ignored the event name, ignored a 5+-row block that was not a *block* (`["candle", [t,o,h,l,c]]`), and dropped quoted prices in both the JSON and regex paths. The site's chart moved; the extension sat still, with the payload visible only in the Protocol Lab. | Named events are understood (`eventKind`: candle/history vs quote/tick), a single candle row and a single `[timestamp, price]` pair are accepted **only** with a name or a parent symbol that identifies the instrument, numeric strings are read, and every extraction path is counted per frame — `Parse paths` in Diagnostics says which one fired. A flat `[t, p, p, p, p]` row is refused so a repeated tick cannot invent a candle. |
+| 5 | **The UI only refreshed on a timer.** The panel pushed on a 1 s interval; the HUD polled once a second. A tick that arrived 20 ms after a poll waited a full second to be drawn. | Market data arriving in the worker now pushes immediately: the side panel is pushed over its port, and the HUD is woken by tab with `feed.new` and re-polls with a 200 ms floor (coalesced to one push per 250 ms). The 1 s poll remains as the safety net. |
+| 6 | **A snapshot could carry a polluted series back.** Broker candles are not derivable from `m1`, and a session restored from an older snapshot rebuilt the mixture. | Snapshot v8 carries the broker candles; on restore, `sync.splitCoarseRuns()` moves any runs of same-spacing bars that were sitting in `m1` back to their real timeframe — a genuine 1-minute series with weekend gaps has 1-minute spacing and is left alone. The repair is counted, not silent. |
+
+Also fixed while in there: `feed.batch` counted a command envelope with no payload as a frame (which inflated the "frames arrive but are not decoded" diagnosis), and the panel's candle-sync line now names the timeframe the bar is aligned to and which series is being drawn, so "site m5 candles" and "computed on 1m closes" can never be confused for one another.
 
 ## What changed from v6.1.0 → v6.2.0
 
@@ -166,7 +186,7 @@ src/
     panel/         side-panel dashboard (Chart · Signal · Journal · Backtest · Feed · Settings)
     popup/         compact status
     options/       site access, data export/import, docs
-tests/             450 tests — run with `npm test`
+tests/             480 tests — run with `npm test`
 ```
 
 ### How the feed works
@@ -180,8 +200,18 @@ tests/             450 tests — run with `npm test`
 3. `hud.js` queues them and flushes every 400 ms or every 60 frames, so a chatty socket
    cannot flood the message channel.
 4. `parsers/quotex.js` decodes: socket.io envelope stripped → `JSON.parse` and a recursive
-   walk → regex fallback. Binary payloads are base64-relayed and UTF-8 decoded.
-5. Ticks land in `store.js`, which aggregates m1 and derives m5/m15/m30.
+   walk → regex fallback. The socket.io event name is kept because it is what tells a bare
+   array of numbers apart (`["candle", …]` versus `["quote", …]`), numeric strings are read,
+   and every extraction path is counted so Diagnostics can say which one resolved a frame.
+5. Ticks land in `store.js`, which aggregates m1 and derives m5/m15.
+6. **Candles the broker sends go where their own spacing says they belong.**
+   `sync.detectTf()` measures the block; a 5-minute history becomes 5-minute candles and
+   never 1-minute ones, and the broker's own candles take precedence over anything derived
+   from ticks — they are the chart the user is looking at.
+7. **A history block also says which chart the site has open**, so with
+   *Follow the site* on (Settings, default on) the extension moves to that pair and
+   timeframe. This is what keeps the site and the side panel from showing two different
+   markets, each internally consistent.
 
 ### Why the service worker survives
 
@@ -229,7 +259,7 @@ rules concur. Six net points with every rule pointing the same way = 100%.
 npm test
 ```
 
-450 tests across 21 files:
+480 tests across 22 files:
 
 - `settlement` — **expiry-accurate settlement**: the price nearest expiry wins, a bar still
   forming is never a close, a late worker settles on the expiry bar not the current price,
@@ -238,8 +268,15 @@ npm test
   through the real message surface
 - `feeds` — Binance/Yahoo parsing, host failover, malformed payloads, rotation bounds, and
   **source authority** (a proxy may not write into a broker-owned series)
+- `sync` — **the timeframe of an incoming block**: spacing detection, a 5-minute block never
+  landing in `m1`, broker candles winning over aggregated ones while the chart still reaches
+  "now", newest-first history being stored rather than dropped, an unreadable block being
+  counted rather than guessed into `m1`, follow-the-site (pair + timeframe, rate-limited,
+  switchable), snapshot round-trip of the broker candles, and the repair of a series an
+  older build had polluted
 - `bootstrap` — a worker restart from a persisted snapshot: selection restored, open trades
-  protected, derived timeframes rebuilt, stale signal cache pruned, polling bounded
+  protected, derived timeframes rebuilt, stale signal cache pruned, polling bounded, and the
+  extension moving onto the pair/timeframe the site's next history block names
 - `panel` — the side panel rendered against a fake DOM: the bankroll card, the stop banner,
   the OTC/proxy warnings, and no card ever rendering `undefined` or `NaN`
 - `ui-ids` — every element id the UI looks up exists, top-level access is static HTML, the

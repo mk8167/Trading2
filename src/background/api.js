@@ -96,7 +96,12 @@ export async function handleMessage(msg, sender) {
       /* ---------------- feed intake ---------------- */
       case 'feed.frame':
       case 'feed.batch': {
-        const frames = Array.isArray(msg.frames) ? msg.frames : [msg.frame || msg];
+        // `[msg.frame || msg]` counted a command envelope with no payload as a
+        // frame, which inflated the frame counter the UI uses to decide
+        // "frames are arriving but not decoding". Only real payloads count.
+        const frames = (Array.isArray(msg.frames) ? msg.frames : msg.frame ? [msg.frame] : []).filter(
+          (f) => f && (typeof f.text === 'string' || typeof f.b64 === 'string')
+        );
         const r = handleBatch(frames);
         if (sender?.tab?.id) store.diag.bridges.add(sender.tab.id);
         return { ok: true, ...r };
@@ -257,6 +262,13 @@ async function stateGet(msg) {
           ticks: st.tickCount,
           stale: store.isStale(st),
           bars: { m1: st.tf.m1.length, m5: st.tf.m5.length, m15: st.tf.m15.length },
+          // Candles the broker itself sent, per timeframe, and how many
+          // history rows we have ever stored. "The site draws candles and we
+          // draw none" is answered by these two numbers.
+          brokerTf: st.brokerLastTf || null,
+          brokerBars: Object.values(st.broker || {}).reduce((a, l) => a + (l ? l.length : 0), 0),
+          historyRows: st.historyRows || 0,
+          historyAt: st.historyAt || 0,
         }
       : null,
     candles: st
@@ -272,7 +284,7 @@ async function stateGet(msg) {
     assetClass: ev.assetClass || null,
     marketOpen: ev.marketOpen !== false,
     secondsToClose: ev.secondsToClose ?? null,
-    sync: buildSync(st, ev.tf, msg.now || Date.now()),
+    sync: buildSync(st, ev.tf, msg.now || Date.now(), s),
     openTrades: ev.open,
     // Starting balance plus realized P&L, and whether it can still cover a
     // stake. The panel shows this so a losing run is visible before it is
@@ -286,6 +298,18 @@ async function stateGet(msg) {
       frames: store.diag.frames,
       ticks: store.diag.ticks,
       historyRows: store.diag.historyRows,
+      // History blocks and the candles the BROKER itself sent for its chart.
+      // A pair with ticks but no broker bars is a pair whose page was never
+      // charted while the extension was listening, which is a completely
+      // different problem from a feed that is not arriving at all.
+      historyBlocks: store.diag.historyBlocks || 0,
+      brokerRows: store.diag.brokerRows || 0,
+      tfSwitches: store.diag.tfSwitches || 0,
+      oddBlocks: store.diag.oddBlocks || 0,
+      repaired: store.diag.repaired || 0,
+      // Which extraction path resolved a frame: json-walk, regex, history,
+      // named-event, single-candle, single-tick, payout, asset-type.
+      methods: { ...(store.diag.methods || {}) },
       binaryFrames: store.diag.binaryFrames,
       unparsed: store.diag.unparsed,
       sockets: store.diag.sockets,
@@ -308,12 +332,13 @@ async function stateGet(msg) {
   return payload;
 }
 
-function buildSync(st, tf, now) {
+function buildSync(st, tf, now, settings) {
   if (!st) return null;
   const t = tf || 'm1';
   const tfMs = TF_MS[t] || TF_MS.m1;
   const series = st.tf?.[t] || [];
   const formingOpen = series.length ? series[series.length - 1].t : null;
+  const own = st.broker?.[t] || null;
   return {
     source: st.source,
     formingOpen,
@@ -321,6 +346,18 @@ function buildSync(st, tf, now) {
     aligned: formingOpen != null ? formingOpen === bucketOf(now, tfMs) : null,
     tickAgeSec: st.ts ? Math.max(0, Math.round((now - st.ts) / 1000)) : null,
     bars: series.length,
+    /** Where the series we are about to draw came from. */
+    barsFrom: own && own.length ? 'broker' : 'ticks',
+    brokerTf: st.brokerLastTf || null,
+    brokerBars: Object.values(st.broker || {}).reduce((a, l) => a + (l ? l.length : 0), 0),
+    /**
+     * The strategy always runs on 1-minute closes (engine.evaluate reads
+     * s.tf.m1), so when the chart on screen is a coarser timeframe the UI has
+     * to say so rather than let the user assume the signal was computed on
+     * what they are looking at.
+     */
+    signalTf: 'm1',
+    followSite: settings ? settings.syncSite !== false : true,
   };
 }
 

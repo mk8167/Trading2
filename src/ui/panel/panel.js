@@ -246,10 +246,11 @@ function renderChartTab(d) {
   const closes = cs.map((c) => c.c);
   const ctx = d.signal?.ctx;
 
+  const sy0 = d.sync || {};
   $('readout').textContent = cs.length
     ? `${cs.length} bars · ${pretty(d.selectedSym)} · ${d.symbol?.source || '?'} feed · ${
         d.symbol?.stale ? 'STALE' : 'live'
-      }`
+      }${sy0.barsFrom === 'broker' ? ` · from the site's own ${tf} candles` : ''}`
     : 'no bars yet';
 
   // Forming preview (early warning) + candle-sync health.
@@ -265,11 +266,25 @@ function renderChartTab(d) {
   const sy = d.sync;
   let syncHtml = '';
   if (sy) {
+    const own = sy.barsFrom === 'broker';
     syncHtml = sy.aligned
-      ? `<div class="i ok">candle sync ✓ — ${esc(sy.source)} feed, bar aligned to the minute</div>`
+      ? `<div class="i ok">candle sync ✓ — ${esc(sy.source)} feed, bar aligned to the ${
+          tf === 'm1' ? 'minute' : tf
+        }${own ? `, drawn from the broker's own ${tf} candles` : ''}</div>`
       : `<div class="i">candle sync ✗ — ${esc(sy.source)} feed${sy.tickAgeSec != null ? `, last tick ${sy.tickAgeSec}s ago` : ''}${
-          sy.aligned === false ? ', bar NOT on the minute boundary' : ''
+          sy.aligned === false ? ', bar NOT on the timeframe boundary' : ''
         }. If this is a proxy feed, it will not match the broker chart.</div>`;
+    // The chart on screen and the series the strategy reads are not always the
+    // same, and pretending otherwise would let the user read a 5-minute chart
+    // as if the call beside it had been made on 5-minute closes.
+    if (tf !== sy.signalTf) {
+      syncHtml += `<div class="i">chart is on <b>${tf}</b>; the call is computed on <b>${esc(
+        sy.signalTf
+      )}</b> closes. Both are shown, so they cannot be confused.</div>`;
+    }
+    if (!sy.followSite) {
+      syncHtml += `<div class="i">Follow-the-site is off, so this pair/timeframe is whatever you picked — it is not tracking the page.</div>`;
+    }
   }
   $('preview').innerHTML = pvHtml + syncHtml;
 
@@ -514,18 +529,32 @@ function breakdownTable(rows, label, fmtFn = (x) => x) {
   );
 }
 
+/** "json-walk 12 · history 3" — which extraction paths are actually firing. */
+function parsePaths(methods) {
+  const rows = Object.entries(methods || {}).sort((a, b) => b[1] - a[1]).slice(0, 4);
+  return rows.length ? rows.map(([k, v]) => `${k} ${v}`).join(' · ') : '—';
+}
+
 function renderFeed(d) {
   const g = d.diag || {};
   $('fdiag').innerHTML = [
     ['Sockets seen', g.sockets ?? 0, 'WebSocket opens on this page'],
     ['Frames', g.frames ?? 0, 'websocket payloads'],
     ['Ticks', g.ticks ?? 0, 'parsed prices'],
-    ['History rows', g.historyRows ?? 0, 'candles seeded'],
+    ['History rows', g.historyRows ?? 0, `candles seeded in ${g.historyBlocks ?? 0} block(s)`],
+    // The broker's own candles, per timeframe. A pair with ticks but no broker
+    // candles is a pair whose chart the broker never sent — a different
+    // problem from a feed that is not arriving at all.
+    ['Site candles', g.brokerRows ?? 0, 'candles the broker sent for its own chart'],
+    ['Timeframe switches', g.tfSwitches ?? 0, 'site timeframe changes seen'],
+    ['Unreadable blocks', g.oddBlocks ?? 0, 'history kept out because its spacing made no sense'],
+    ['Series repaired', g.repaired ?? 0, 'older candles moved to their real timeframe'],
     ['Binary frames', g.binaryFrames ?? 0, 'non-text'],
     ['Unparsed', g.unparsed ?? 0, 'see Protocol Lab'],
     ['Instruments', g.pairs ?? 0, 'in memory'],
     ['Last frame', g.lastFrameAge != null ? (g.lastFrameAge / 1000).toFixed(0) + 's ago' : 'never', 'age of the newest socket payload'],
     ['REST polls', g.restPolls ?? 0, 'fallback feed calls made'],
+    ['Parse paths', parsePaths(g.methods), 'how frames were decoded'],
     // Provenance. If a delayed proxy has been knocking on a broker-owned
     // series, or the broker took a series back and reset it, the user should
     // be able to see that here rather than wonder why a chart jumped.
@@ -602,6 +631,7 @@ function renderSettings(d) {
     chk('sAuto', s.autoPaperTrade); chk('sDesk', al.desktop); chk('sSound', al.sound);
     chk('sMtf', st.useMtf); chk('sPat', st.usePatterns); chk('sLvl', st.useLevels);
     chk('sGate', st.gateEnabled); chk('sBinance', fd.binance); chk('sYahoo', fd.yahoo);
+    chk('sFollow', s.syncSite !== false);
     settingsLoaded = true;
   }
 }
@@ -645,6 +675,7 @@ $('sSave').addEventListener('click', async () => {
     riskPct: Number($('sRisk').value) || 1,
     payout: Number($('sPay').value) || 86,
     autoPaperTrade: $('sAuto').checked,
+    syncSite: $('sFollow').checked,
     alerts: { desktop: $('sDesk').checked, sound: $('sSound').checked },
     feeds: { binance: $('sBinance').checked, yahoo: $('sYahoo').checked },
     strategy: {

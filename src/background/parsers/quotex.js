@@ -143,15 +143,87 @@ export function extract(text) {
   return result;
 }
 
+/**
+ * Read a number that may have been sent as a string.
+ *
+ * JSON from a broker mirror is not typed consistently: the same field can be
+ * `1.0845` on one mirror and `"1.0845"` on the next, and a tick that arrives
+ * as a string used to be dropped without a word — the payload parsed, the
+ * price was simply never extracted, so the pair appeared silent while the
+ * broker's own chart was moving. Only plain decimal strings are accepted, so
+ * a timestamp or a symbol can never be mistaken for a price.
+ */
+export function asNumber(v) {
+  if (typeof v === 'number') return Number.isFinite(v) ? v : null;
+  if (typeof v !== 'string') return null;
+  const t = v.trim();
+  if (!t || t.length > 24 || !/^-?\d+(?:\.\d+)?$/.test(t)) return null;
+  const n = Number(t);
+  return Number.isFinite(n) ? n : null;
+}
+
 function emitTick(res, sym, price, ts) {
   const s = normalizeSymbol(sym);
   if (!isSymbol(s)) return false;
-  const p = Number(price);
-  if (!Number.isFinite(p) || p <= 0 || p > 1e9) return false;
+  const p = asNumber(price);
+  if (p == null || p <= 0 || p > 1e9) return false;
   const t = ts == null ? null : normaliseMs(ts);
   if (t != null && (t < MIN_TS || t > Date.now() + MAX_TS_SKEW)) return null;
   res.ticks.push({ sym: s, price: p, ts: t });
   return true;
+}
+
+/* ------------------------- named socket.io events -------------------- */
+
+/** A socket.io frame's first element can be the event name: ["quote", {...}]. */
+const EVENT_NAME_RE = /^[a-z][a-z0-9_:-]{0,46}$/i;
+
+/**
+ * Name → what the numbers in that event mean.
+ *
+ * The broker labels its own frames, and the label is the only thing that makes
+ * a bare array of numbers unambiguous. `["history", [...]]` and
+ * `["candle", [...]]` are candles; `["quote", [...]]` is a price. Without the
+ * label the parser had to guess, and the safe guess was to ignore the frame —
+ * which is why a site chart could be perfectly live while the extension showed
+ * nothing at all.
+ */
+export function eventKind(name) {
+  const n = String(name || '').toLowerCase();
+  if (!n) return null;
+  if (/histor|ohlc|candle|\bbar/.test(n)) return 'candles';
+  if (/\b(tick|quote|price|rate|update|feed|trade)s?\b/.test(n)) return 'tick';
+  return null;
+}
+
+/**
+ * One candle sent on its own: [t,o,h,l,c] (the shape rowToCandle already
+ * understands). Returns null unless the numbers can only be a candle.
+ */
+export function singleCandleRow(arr) {
+  if (!Array.isArray(arr) || arr.length < 5 || arr.length > 6) return null;
+  const nums = arr.slice(0, 5).map(asNumber);
+  if (nums.some((v) => v == null)) return null;
+  const [t, a, b, x, y] = nums;
+  if (t < 1e9) return null; // not an epoch seconds/ms clock
+  const ms = t < 1e12 ? t * 1000 : t;
+  if (ms < MIN_TS || ms > Date.now() + MAX_TS_SKEW) return null;
+  if (![a, b, x, y].every((v) => v > 0 && v < 1e7)) return null;
+  // o === h === l === c is a tick repeated four times, not a candle.
+  if (a === b && b === x && x === y) return null;
+  return rowToCandle([t, a, b, x, y]);
+}
+
+/** One tick sent on its own: [t, price] or [price, t]. */
+export function singleTickRow(arr) {
+  if (!Array.isArray(arr) || arr.length !== 2) return null;
+  const a = asNumber(arr[0]);
+  const b = asNumber(arr[1]);
+  if (a == null || b == null) return null;
+  const isClock = (v) => v >= 1e9 && v < 1e11;
+  if (isClock(a) && !isClock(b) && b > 0) return { ts: a, price: b };
+  if (isClock(b) && !isClock(a) && a > 0) return { ts: b, price: a };
+  return null;
 }
 
 function normaliseMs(ts) {
@@ -160,7 +232,7 @@ function normaliseMs(ts) {
   return n < 1e11 ? Math.round(n * 1000) : Math.round(n);
 }
 
-function walk(node, inherited, res, depth = 0) {
+function walk(node, inherited, res, depth = 0, event = null) {
   if (node == null || depth > 12) return;
 
   if (Array.isArray(node)) {
@@ -175,11 +247,63 @@ function walk(node, inherited, res, depth = 0) {
       const rows = node.map(rowToCandle).filter(Boolean);
       if (rows.length >= 5) {
         const sym = inherited ? normalizeSymbol(inherited) : null;
-        if (sym && isSymbol(sym)) res.history.push({ sym, rows });
+        if (sym && isSymbol(sym)) {
+          res.history.push({ sym, rows, from: event || 'block' });
+          if (event) res.methods.push('named-event');
+          return;
+        }
+      }
+    }
+
+    /* socket.io wraps every frame as [eventName, payload]. The name is the
+     * only thing that tells a bare array of numbers apart, so it is carried
+     * down instead of being thrown away — a ["history", [...]] frame used to
+     * be unroutable and simply vanished. */
+    let ev = event;
+    let items = node;
+    const first = typeof node[0] === 'string' ? node[0] : null;
+    // An event name, not an instrument. "candle" and "quote" are six letters
+    // and four letters, which is also the shape of "AUDCAD" — so a label is
+    // only treated as one when it names a kind of data (eventKind) or when it
+    // cannot be an instrument at all. A real tick row starts with a symbol
+    // followed by a number, so it can never take this branch.
+    const isEventName = !!first && EVENT_NAME_RE.test(first) && (eventKind(first) || !isSymbol(first)) && node.length >= 2;
+    if (isEventName) {
+      ev = first.toLowerCase();
+      items = node.slice(1);
+    }
+    const kind = eventKind(ev);
+
+    // Candles sent one at a time, for the pair this event is about. The frame
+    // itself is scanned too: ["candle", [t,o,h,l,c]] carries the row inline,
+    // while ["candle", {data: [t,o,h,l,c]}] reaches it through the object.
+    if (kind === 'candles' || inherited) {
+      const scan = [];
+      for (const item of [node, ...items]) if (Array.isArray(item) && !scan.includes(item)) scan.push(item);
+      const rows = scan.map(singleCandleRow).filter(Boolean);
+      const sym = inherited ? normalizeSymbol(inherited) : null;
+      if (rows.length && sym && isSymbol(sym)) {
+        res.history.push({ sym, rows, from: ev || 'single' });
+        res.methods.push('single-candle');
         return;
       }
     }
-    for (const item of node) walk(item, inherited, res, depth + 1);
+
+    // Bare prices for a pair we already know, from an event that says so.
+    if (kind === 'tick' && inherited) {
+      let n = 0;
+      for (const item of items) {
+        if (!Array.isArray(item) || item === node) continue;
+        const t = singleTickRow(item);
+        if (t && emitTick(res, inherited, t.price, t.ts)) n++;
+      }
+      if (n) {
+        res.methods.push('single-tick');
+        return;
+      }
+    }
+
+    for (const item of items) walk(item, inherited, res, depth + 1, ev);
     return;
   }
 
@@ -198,6 +322,14 @@ function walk(node, inherited, res, depth = 0) {
       if (SYMBOL_KEY_RE.test(key) && isSymbol(v)) sym = normalizeSymbol(v);
       else if (!sym && isSymbol(v) && v.length > 4) sym = normalizeSymbol(v);
       if (type == null && TYPE_KEY_RE.test(key) && v.trim()) type = v.trim();
+      // Numbers arrive as strings on some mirrors; the key decides what the
+      // string means, exactly as it does for a real number.
+      const n = asNumber(v);
+      if (n != null) {
+        if (price == null && PRICE_KEY_RE.test(key)) price = n;
+        if (ts == null && TIME_KEY_RE.test(key)) ts = n;
+        if (payout == null && PAYOUT_KEY_RE.test(key)) payout = n;
+      }
     } else if (typeof v === 'boolean') {
       if (otcHint == null && OTC_KEY_RE.test(key)) otcHint = v;
     } else if (typeof v === 'number' && Number.isFinite(v)) {
@@ -229,7 +361,7 @@ function walk(node, inherited, res, depth = 0) {
 
   for (const key of Object.keys(node)) {
     const v = node[key];
-    if (v && typeof v === 'object') walk(v, sym, res, depth + 1);
+    if (v && typeof v === 'object') walk(v, sym, res, depth + 1, event);
   }
 }
 
@@ -244,11 +376,16 @@ export function tryTickRow(arr) {
   if (!Array.isArray(arr) || arr.length < 3) return null;
   const symIdx = arr.findIndex((v) => typeof v === 'string' && isSymbol(v));
   if (symIdx < 0) return null;
-  const tsIdx = arr.findIndex(
-    (v, i) => i !== symIdx && typeof v === 'number' && Number.isFinite(v) && v > 1e9 && v < 1e11
-  );
+  const tsIdx = arr.findIndex((v, i) => {
+    if (i === symIdx) return false;
+    const n = asNumber(v);
+    return n != null && n > 1e9 && n < 1e11;
+  });
   if (tsIdx < 0) return null;
-  const okPrice = (v) => typeof v === 'number' && Number.isFinite(v) && v > 0 && v < 1e7;
+  const okPrice = (v) => {
+    const n = asNumber(v);
+    return n != null && n > 0 && n < 1e7;
+  };
 
   // Canonical layout is [symbol, timestamp, price, flag]. When the row
   // matches it positionally, take the price from that exact slot — never
@@ -308,13 +445,17 @@ export function rowToCandle(row) {
  * letter-count guard, so widening here cannot invent a phantom instrument. */
 const SYM_PART = String.raw`[A-Za-z0-9]{2,10}(?:[-/.][A-Za-z0-9]{2,10})?(?:[\s_-]?otc)?`;
 
+/* Numbers may be quoted on the wire ("price":"1.0845"). Every numeric group
+ * below therefore tolerates quotes: a quoted price used to require a digit
+ * immediately after the colon, so those frames fell through both extraction
+ * paths and survived only as a Protocol Lab sample. */
 const RE_OBJ_TICK = new RegExp(
-  `(${SYM_PART})["']?\\s*:\\s*\\{[^{}]{0,250}?"(?:price|rate|quote|last|close|bid|ask)"\\s*:\\s*([0-9]+(?:\\.[0-9]+)?)`,
+  `(${SYM_PART})["']?\\s*:\\s*\\{[^{}]{0,250}?"(?:price|rate|quote|last|close|bid|ask)"\\s*:\\s*["']?([0-9]+(?:\\.[0-9]+)?)`,
   'gi'
 );
 
 const RE_ARR_TICK = new RegExp(
-  `['"]?(${SYM_PART})['"]?\\s*[,:]\\s*(1[0-9]{9}(?:\\.[0-9]+)?)\\s*[,:]\\s*([0-9]+(?:\\.[0-9]+)?)`,
+  `['"]?(${SYM_PART})['"]?\\s*[,:]\\s*["']?(1[0-9]{9}(?:\\.[0-9]+)?)["']?\\s*[,:]\\s*["']?([0-9]+(?:\\.[0-9]+)?)`,
   'gi'
 );
 

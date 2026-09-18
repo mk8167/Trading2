@@ -399,3 +399,70 @@ test('candidate pairs get a real verdict without being able to trade', async () 
   assert.equal(row.dir, cached.dir, 'the row reports the verdict the engine actually holds');
   assert.ok(r.diag.candidates >= 2, 'candidate evaluations are counted in the Feed diagnostics');
 });
+
+/* ------------------- the broker's own chart, end to end --------------- */
+
+/* The extension used to file every history block as 1-minute data, whatever
+ * timeframe the broker sent it in. These two tests are the whole point of the
+ * sync work: the 5-minute candles the site is drawing must arrive as 5-minute
+ * candles, and the 1-minute series must stay what it says it is. */
+
+const m5Block = (n = 12) =>
+  Array.from({ length: n }, (_, i) => [
+    T0 + i * 300,
+    +(1.1 + i * 0.001).toFixed(5),
+    +(1.101 + i * 0.001).toFixed(5),
+    +(1.099 + i * 0.001).toFixed(5),
+    +(1.1005 + i * 0.001).toFixed(5),
+  ]);
+
+test("the broker\'s 5-minute history is stored as 5-minute candles, not as m1", async () => {
+  const before = store.getSymbol(SYM).tf.m1.length;
+  const r = await send('feed.batch', {
+    frames: [
+      {
+        text: `42["history",{"s":"EURUSD_otc","data":${JSON.stringify(m5Block(12))}}]`,
+        binary: false,
+        url: 'wss://example.test/socket.io/',
+      },
+    ],
+  });
+  assert.equal(r.history, 12, 'the block was stored');
+
+  const st = store.getSymbol(SYM);
+  assert.equal(st.tf.m1.length, before, 'the 1-minute series must not gain 5-minute bars');
+  assert.equal(st.broker.m5.length, 12, 'they belong to the 5-minute series');
+  assert.equal(st.brokerLastTf, 'm5');
+
+  await send('settings.patch', { patch: { tf: 'm5' } });
+  const p = await send('state.get', { candles: 120 });
+  assert.equal(p.sync.barsFrom, 'broker', 'the 5m chart is drawn from the broker candles');
+  assert.equal(p.sync.brokerTf, 'm5');
+  assert.equal(p.sync.signalTf, 'm1', 'and the call is still computed on 1m closes');
+  assert.equal(p.sync.aligned, true, 'the newest bar is the bucket we are in');
+  assert.equal(p.symbol.brokerBars, 12);
+  assert.ok(p.diag.brokerRows >= 12, 'and Diagnostics can prove it');
+  assert.ok((p.diag.methods['json-walk'] || 0) >= 1, 'with the extraction path recorded');
+  await send('settings.patch', { patch: { tf: 'm1' } });
+});
+
+test('a proxy time frame is never invented from a mixed series', async () => {
+  // Five 5-minute candles interleaved with 4 one-minute bars is not a
+  // timeframe, and the parser must decline to call it one rather than route
+  // those rows somewhere plausible-looking.
+  const mixed = [...m5Block(5), ...[0, 1, 2, 3].map((i) => [T0 + 3000 + i * 60, 1.2, 1.201, 1.199, 1.2005])];
+  const r = await send('feed.batch', {
+    frames: [
+      {
+        text: `42["history",{"s":"EURUSD_otc","data":${JSON.stringify(mixed)}}]`,
+        binary: false,
+        url: 'wss://example.test/socket.io/',
+      },
+    ],
+  });
+  assert.equal(r.ok, true);
+  const st = store.getSymbol(SYM);
+  assert.equal(st.broker.m5.length, 12, 'the earlier 5-minute block is untouched');
+  const p = await send('state.get', {});
+  assert.ok(p.diag.oddBlocks >= 1, 'and the unreadable block is counted, not guessed at');
+});

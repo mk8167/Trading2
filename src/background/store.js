@@ -9,12 +9,15 @@
  * previous version.
  * ----------------------------------------------------------------*/
 
-import { makeSeries, pushTick, upsertCandle, aggregate, trim, lastOf, normaliseTs, compact, expand, DEFAULT_CAP, TF_MS } from './candles.js';
+import { makeSeries, pushTick, upsertCandle, isCandle, aggregate, trim, lastOf, normaliseTs, compact, expand, DEFAULT_CAP, TF_MS } from './candles.js';
+import { detectTf, minuteSpaced, splitCoarseRuns } from './sync.js';
 import { canonical, classifyWith, pretty as prettyName, classPayout } from './symbols.js';
 
 export const MAX_SYMBOLS = 64;
 export const PERSIST_SYMBOLS = 24;
 export const PERSIST_CANDLES = 150;
+/** How many broker-sent (coarser timeframe) candles a pair keeps. */
+export const BROKER_CAP = 400;
 
 /** sym -> SymbolState (keys are always canonical — see symbols.js) */
 export const symbols = new Map();
@@ -51,8 +54,16 @@ export const diag = {
   frames: 0,
   ticks: 0,
   historyRows: 0,
+  /** How many history blocks have been stored, and how they were filed. */
+  historyBlocks: 0,
+  brokerRows: 0,
+  tfSwitches: 0,
+  /** History blocks whose timeframe could not be read — kept out, not guessed. */
+  oddBlocks: 0,
   binaryFrames: 0,
   unparsed: 0,
+  /** Extraction path -> how many frames it resolved (Diagnostics). */
+  methods: {},
   sockets: 0,
   samples: [],
   errors: [],
@@ -74,8 +85,13 @@ export function resetDiag() {
   diag.frames = 0;
   diag.ticks = 0;
   diag.historyRows = 0;
+  diag.historyBlocks = 0;
+  diag.brokerRows = 0;
+  diag.tfSwitches = 0;
+  diag.oddBlocks = 0;
   diag.binaryFrames = 0;
   diag.unparsed = 0;
+  diag.methods = {};
   diag.sockets = 0;
   diag.samples = [];
   diag.errors = [];
@@ -142,6 +158,17 @@ export function ensureSymbol(sym, source = LIVE_SOURCE, hint = null, opts = null
       tickCount: 0,
       seenAt: Date.now(),
       lastTickAt: 0,
+      /**
+       * Candles the BROKER sent for its own chart, per timeframe, when that
+       * chart was not on m1. Kept apart from `tf` (which is built from ticks)
+       * so a block of 5-minute candles can never be mistaken for 1-minute
+       * data — see ingestHistory() and sync.js.
+       */
+      broker: {},
+      brokerAt: 0,
+      brokerLastTf: null,
+      historyRows: 0,
+      historyAt: 0,
       tf: { m1: makeSeries(TF_MS.m1), m5: makeSeries(TF_MS.m5), m15: makeSeries(TF_MS.m15) },
     };
     symbols.set(key, s);
@@ -260,17 +287,67 @@ export function ingestTick(sym, price, ts = null, source = 'quotex', hint = null
   return s;
 }
 
-/** Apply a block of history rows; also back-fills the live price. */
-export function ingestHistory(sym, rows, source = 'quotex', hint = null) {
+/**
+ * Apply a block of history rows; also back-fills the live price.
+ *
+ * Two things are decided here, and both of them were silently wrong before.
+ *
+ * 1. WHICH TIMEFRAME the block is in. The broker sends candles for the chart
+ *    the user is looking at, so a user on a 5-minute chart receives 5-minute
+ *    candles. Filing those into the m1 series made the m1 series a mix of
+ *    real 1-minute tick bars and 5/15-minute broker bars: every indicator,
+ *    every aggregate, the "last closed bar" the strategy fires on and the
+ *    chart all reported numbers that belonged to no timeframe at all. The
+ *    extension's chart could therefore never match the broker's.
+ * 2. THE ORDER. upsertCandle() refuses to rewrite history, so a block that
+ *    arrives newest-first used to leave exactly one candle behind. Rows are
+ *    sorted before they are stored.
+ *
+ * @param {{tf?:string}} [opts] the timeframe the block is known to be in;
+ *   measured from the row spacing when it is not supplied.
+ * @returns {number} rows stored
+ */
+export function ingestHistory(sym, rows, source = 'quotex', hint = null, opts = null) {
   if (!sym || !Array.isArray(rows) || !rows.length) return 0;
   const s = ensureSymbol(sym, source, hint);
   if (!s) return 0;
-  let n = 0;
-  for (const c of rows) {
-    if (upsertCandle(s.tf.m1, c, DEFAULT_CAP.m1)) n++;
+
+  const sorted = rows.filter(isCandle).slice().sort((a, b) => a.t - b.t);
+  if (!sorted.length) return 0;
+
+  const tf = (opts && opts.tf) || detectTf(sorted) || (minuteSpaced(sorted) ? 'm1' : null);
+  if (!tf) {
+    // A block whose spacing cannot be read. Filing it as 1-minute data is how
+    // the m1 series got polluted in the first place, so it is counted and kept
+    // out instead — Diagnostics shows the count, and the Protocol Lab keeps the
+    // payload, so "some frames were not stored" is visible rather than silent.
+    diag.oddBlocks = (diag.oddBlocks || 0) + 1;
+    s.historyRows += sorted.length;
+    s.historyAt = Date.now();
+    return 0;
   }
+  let n = 0;
+  let list = null;
+  if (tf === 'm1') {
+    for (const c of sorted) if (upsertCandle(s.tf.m1, c, DEFAULT_CAP.m1)) n++;
+  } else {
+    list = s.broker[tf] || makeSeries(TF_MS[tf] || TF_MS.m5);
+    for (const c of sorted) if (upsertCandle(list, c, BROKER_CAP)) n++;
+    if (n) {
+      if (s.brokerLastTf && s.brokerLastTf !== tf) diag.tfSwitches++;
+      s.broker[tf] = list;
+      s.brokerLastTf = tf;
+      s.brokerAt = Date.now();
+      diag.brokerRows += n;
+    }
+  }
+
   if (n) {
-    const last = lastOf(s.tf.m1);
+    diag.historyBlocks++;
+    diag.historyRows += n;
+    s.historyRows += n;
+    s.historyAt = Date.now();
+    const last = tf === 'm1' ? lastOf(s.tf.m1) : lastOf(list);
     if (last) {
       if (!Number.isFinite(s.price) || last.t >= s.ts) {
         s.price = last.c;
@@ -278,7 +355,6 @@ export function ingestHistory(sym, rows, source = 'quotex', hint = null) {
       }
       s.lastTickAt = Date.now();
     }
-    diag.historyRows += n;
   }
   return n;
 }
@@ -339,15 +415,39 @@ export function effectivePayout(sym, settingsPayout) {
   return { payout: userPayout ?? 86, origin: 'setting' };
 }
 
-/** Rebuild m5/m15 from m1. Cheap enough to call on demand. */
+/**
+ * Rebuild m5/m15. Cheap enough to call on demand.
+ *
+ * When the broker has sent candles for a timeframe itself, those candles are
+ * the chart the user is looking at — they win over anything aggregated from
+ * our own ticks. Bars newer than the last broker candle (ticks that arrived
+ * between two history blocks) are appended so the series still ends at "now"
+ * instead of at the last time the broker felt like sending history.
+ */
 export function refreshDerived(sym) {
   const s = symbols.get(canonical(sym));
   if (!s) return null;
-  s.tf.m5 = aggregate(s.tf.m1, TF_MS.m5, DEFAULT_CAP.m5);
-  s.tf.m15 = aggregate(s.tf.m1, TF_MS.m15, DEFAULT_CAP.m15);
-  s.tf.m5.__tfMs = TF_MS.m5;
-  s.tf.m15.__tfMs = TF_MS.m15;
+  for (const tf of ['m5', 'm15']) {
+    const agg = aggregate(s.tf.m1, TF_MS[tf], DEFAULT_CAP[tf]);
+    agg.__tfMs = TF_MS[tf];
+    const own = s.broker[tf];
+    s.tf[tf] = own && own.length ? mergeUp(own, agg, DEFAULT_CAP[tf], TF_MS[tf]) : agg;
+  }
   return s;
+}
+
+/** Broker candles first; append only what is strictly newer from `agg`. */
+function mergeUp(broker, agg, cap, tfMs) {
+  const out = broker.slice(-cap);
+  let lastT = out.length ? out[out.length - 1].t : -Infinity;
+  for (const c of agg) {
+    if (c.t <= lastT) continue;
+    out.push({ t: c.t, o: c.o, h: c.h, l: c.l, c: c.c });
+    lastT = c.t;
+  }
+  trim(out, cap);
+  out.__tfMs = tfMs || broker.__tfMs || TF_MS.m5;
+  return out;
 }
 
 export function isStale(s, now = Date.now()) {
@@ -371,6 +471,13 @@ export function listSymbols() {
       payout: s.payout,
       ticks: s.tickCount,
       bars: s.tf.m1.length,
+      // Candles the broker itself sent (they are the broker's chart), and how
+      // many history rows we have ever stored for this pair. Both are shown in
+      // Diagnostics: "0 broker bars while the site shows candles" is the
+      // difference between a feed problem and a parsing problem.
+      brokerTf: s.brokerLastTf || null,
+      brokerBars: Object.values(s.broker || {}).reduce((a, l) => a + (l ? l.length : 0), 0),
+      historyRows: s.historyRows || 0,
       stale: isStale(s),
       selected: protectedSyms.has(s.sym),
     }))
@@ -402,9 +509,22 @@ export function serialize({ limit = PERSIST_SYMBOLS, bars = PERSIST_CANDLES } = 
       tickCount: s.tickCount,
       lastTickAt: s.lastTickAt,
       m1: compact(s.tf.m1.slice(-bars)),
+      // Broker candles are not derivable from m1 (that is the whole point of
+      // keeping them apart), so losing them across a worker restart would
+      // blank the chart the user is actually watching.
+      broker: brokerRows(s, bars),
     };
   }
-  return { v: 7, at: Date.now(), symbols: out };
+  return { v: 8, at: Date.now(), symbols: out };
+}
+
+/** {m5: [[t,o,h,l,c],...], m15: [...]} — only the timeframes we hold. */
+function brokerRows(s, bars) {
+  const out = {};
+  for (const [tf, list] of Object.entries(s.broker || {})) {
+    if (list && list.length) out[tf] = compact(list.slice(-bars));
+  }
+  return Object.keys(out).length ? out : null;
 }
 
 export function deserialize(snap) {
@@ -423,6 +543,8 @@ export function deserialize(snap) {
     // one key, so their candles are merged rather than letting whichever
     // came second overwrite the first.
     mergeSeries(s, expand(data.m1));
+    adoptBroker(s, data.broker);
+    healSeries(s);
     refreshDerived(key);
     s.price = Number.isFinite(data.price) ? data.price : s.price;
     s.ts = data.ts || s.ts;
@@ -433,6 +555,52 @@ export function deserialize(snap) {
     n++;
   }
   return n;
+}
+
+/** Restore the broker's own candles from a snapshot (v8 and later). */
+function adoptBroker(s, broker) {
+  if (!broker || typeof broker !== 'object') return 0;
+  let n = 0;
+  for (const [tf, rows] of Object.entries(broker)) {
+    if (!TF_MS[tf] || tf === 'm1' || !Array.isArray(rows) || !rows.length) continue;
+    const list = s.broker[tf] || makeSeries(TF_MS[tf]);
+    for (const c of expand(rows)) if (upsertCandle(list, c, BROKER_CAP)) n++;
+    if (list.length) s.broker[tf] = list;
+  }
+  if (n) {
+    s.brokerAt = Date.now();
+    diag.brokerRows += n;
+  }
+  return n;
+}
+
+/**
+ * Unpick a series built by a build that did not know the broker's timeframe.
+ *
+ * Snapshots written before v8 can hold the broker's 5- and 15-minute candles
+ * inside the m1 series, because every history block used to be filed as
+ * 1-minute data. Those bars are moved to the timeframe they belong to, so a
+ * restored session does not keep computing indicators on a series that is not
+ * what it claims to be. Only runs of consecutive same-spacing bars are moved
+ * (see sync.splitCoarseRuns), so a genuine m1 series with gaps is untouched.
+ */
+function healSeries(s) {
+  const { m1, coarse } = splitCoarseRuns(s.tf.m1, { minRun: 4 });
+  const moved = coarse.m5.length + coarse.m15.length;
+  if (!moved) return 0;
+  const clean = makeSeries(TF_MS.m1);
+  for (const c of m1) upsertCandle(clean, c, DEFAULT_CAP.m1);
+  s.tf.m1 = clean;
+  for (const tf of ['m15', 'm5']) {
+    const run = coarse[tf];
+    if (!run.length) continue;
+    const list = s.broker[tf] || makeSeries(TF_MS[tf]);
+    for (const c of run) upsertCandle(list, c, BROKER_CAP);
+    s.broker[tf] = list;
+  }
+  s.brokerAt = Date.now();
+  diag.repaired = (diag.repaired || 0) + moved;
+  return moved;
 }
 
 /** Union two candle sets into the symbol's m1 series, newest-wins per bar. */
@@ -464,6 +632,7 @@ export function housekeep() {
     trim(s.tf.m1, DEFAULT_CAP.m1);
     trim(s.tf.m5, DEFAULT_CAP.m5);
     trim(s.tf.m15, DEFAULT_CAP.m15);
+    for (const list of Object.values(s.broker || {})) trim(list, BROKER_CAP);
   }
 }
 

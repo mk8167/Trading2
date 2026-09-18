@@ -13,7 +13,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { install, alarms, reset as resetChrome } from './chrome-stub.mjs';
 
-install();
+const { listeners } = install();
 const store = await import('../src/background/store.js');
 const settings = await import('../src/background/settings.js');
 const ledger = await import('../src/background/ledger.js');
@@ -119,7 +119,7 @@ test('the first tick saves a fresh snapshot', async () => {
   const got = await chrome.storage.session.get(SNAPSHOT_KEY);
   const snap = got?.[SNAPSHOT_KEY];
   assert.ok(snap, 'a snapshot is in session storage');
-  assert.equal(snap.v, 7, 'current snapshot version');
+  assert.equal(snap.v, 8, 'current snapshot version (v8 carries the broker candles)');
   assert.ok(snap.at > 1, 'boot actually rewrote it, this is not the fixture we planted');
   assert.ok(snap.symbols[WATCHED], 'and the watched pair is in it');
   assert.ok(Array.isArray(snap.symbols[WATCHED].m1), 'with its candles');
@@ -169,3 +169,46 @@ test('a second boot is a no-op rather than a second heartbeat', async () => {
 });
 
 mock.timers.reset();
+
+/* ------------------------- following the site ------------------------ */
+
+/* The broker sends candles for the chart the user has open, so a history block
+ * names the pair AND the timeframe the page is showing. Until this existed, the
+ * extension kept its own pair and its own timeframe — which is exactly how the
+ * site and the side panel ended up displaying two different charts. */
+
+const historyFrame = (sym, tfMs, n = 10) => {
+  const rows = Array.from({ length: n }, (_, i) => {
+    const t = Math.floor((Date.now() - 20 * 60_000) / 60_000) * 60 + i * (tfMs / 1000);
+    return [t, 1.2 + i * 0.001, 1.201 + i * 0.001, 1.199 + i * 0.001, 1.2005 + i * 0.001];
+  });
+  return {
+    text: `42["history",{"s":"${sym}","data":${JSON.stringify(rows)}}]`,
+    binary: false,
+    url: 'wss://example.test/socket.io/',
+  };
+};
+
+const deliver = (msg) => new Promise((res) => listeners.message[0](msg, { tab: { id: 7 } }, res));
+
+test('history for another pair moves the extension onto the site\'s chart', async () => {
+  const r = await deliver({ cmd: 'feed.batch', frames: [historyFrame('GBPJPY_otc', 300_000)] });
+  assert.equal(r.history, 10, 'the block was stored');
+  await settle();
+  const s = await settings.load();
+  assert.equal(s.selectedSym, 'GBPJPY_OTC', 'the pair is now the one the site charted');
+  assert.equal(s.tf, 'm5', 'and so is the timeframe');
+  assert.equal(store.selected, 'GBPJPY_OTC', 'the store is protecting what we are watching');
+  assert.ok(store.isProtected('GBPJPY_OTC'));
+});
+
+test('with follow-the-site off, the user\'s own choice is not overridden', async () => {
+  await settings.patch({ syncSite: false });
+  const before = (await settings.load()).selectedSym;
+  await deliver({ cmd: 'feed.batch', frames: [historyFrame('AUDCAD_otc', 900_000)] });
+  await settle();
+  const s = await settings.load();
+  assert.equal(s.selectedSym, before, 'the extension stays where the user put it');
+  assert.equal(s.tf, 'm5', 'and on the timeframe they had');
+  await settings.patch({ syncSite: true });
+});
